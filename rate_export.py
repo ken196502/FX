@@ -197,19 +197,43 @@ def _fetch_safe(label: str, errors: list[str], func, *args) -> dict:
         return {}
 
 
-def _is_business_day(date_str: str) -> bool:
-    """判断日期是否为周一至周五（不判断公众假期）。
+# 香港公众假期（用于判断 HKEx 是否开市）。加载失败则回退到仅按工作日判断，
+# 以免依赖缺失导致整个流程崩溃。
+try:
+    import holidays as _holidays_lib
+    _HK_HOLIDAYS = _holidays_lib.country_holidays(
+        "HK", years=range(2020, 2041),
+    )
+except Exception:  # pragma: no cover - 依赖缺失时仅按工作日判断
+    _HK_HOLIDAYS = None
+    logger.warning(
+        "未能加载 holidays 库，将仅按周一至周五判断 HKEx 交易日（不含公众假期）"
+    )
+
+
+def _is_hk_trading_day(date_str: str) -> bool:
+    """判断日期是否为 HKEx 交易日（周一至周五 且非香港公众假期）。
+
+    HKEx 在周末及香港公众假期不发布印花税率；此时取不到、或取到的是
+    上一交易日（非当日）的汇率，都属于正常现象，不应当作错误。
+    中银香港(BOCHK)在假期仍可能提供参考汇率，因此「非交易日」也用于放宽
+    对 BOCHK 的当日校验。
 
     Args:
         date_str: YYYYMMDD 格式日期
 
     Returns:
-        True 表示周一至周五
+        True 表示 HKEx 应当开市并发布当日汇率
     """
     try:
-        return dt.datetime.strptime(date_str, "%Y%m%d").weekday() < 5
+        d = dt.datetime.strptime(date_str, "%Y%m%d").date()
     except ValueError:
         return True
+    if d.weekday() >= 5:
+        return False
+    if _HK_HOLIDAYS is not None and d in _HK_HOLIDAYS:
+        return False
+    return True
 
 
 def _check_update_date(
@@ -220,8 +244,8 @@ def _check_update_date(
 ) -> None:
     """校验数据的资料更新时间是否为目标日期，不是当日则记为错误。
 
-    目标日期本身是非工作日（周末）时，HKEx/BOCHK 不会发布当日汇率，
-    此时只记录日志，不算错误。
+    目标日期本身非交易日（周末/香港公众假期）时，HKEx/BOCHK 不会发布
+    当日汇率，此时只记录日志，不算错误。
 
     Args:
         label: 数据源名称
@@ -246,11 +270,11 @@ def _check_update_date(
         f"{label}: 汇率不是当日的 "
         f"(资料更新时间 {update_time}, 期望日期 {date_str})"
     )
-    if _is_business_day(date_str):
+    if _is_hk_trading_day(date_str):
         errors.append(msg)
         logger.warning("[RE] %s", msg)
     else:
-        logger.info("[RE] %s (目标日期非工作日, 仅记录)", msg)
+        logger.info("[RE] %s (目标日期非交易日, 仅记录)", msg)
 
 
 def _collect_bochk_rates(date_str: str, errors: list[str]) -> list[dict]:
@@ -299,6 +323,10 @@ def _collect_bochk_usd_rates(date_str: str, errors: list[str]) -> list[dict]:
 def _collect_hkex_rates(date_str: str, errors: list[str]) -> dict:
     """从 HKEx 网站获取印花税率汇率。
 
+    HKEx 仅在交易日（周一至五且非香港公众假期）发布印花税率。
+    非交易日即使抓到上一交易日的数据也直接丢弃，绝不展示以免误导；
+    同时也不记为错误。交易日则必须拿到当日数据，否则记错。
+
     Args:
         date_str: YYYYMMDD 格式日期
         errors: 错误信息收集列表
@@ -308,19 +336,36 @@ def _collect_hkex_rates(date_str: str, errors: list[str]) -> dict:
     """
     data = _fetch_safe("HKEx 印花税率", errors, fetch_hkex_stampfx, date_str)
     if not data:
-        errors.append(f"HKEx: 未获取到印花税率数据 (日期 {date_str})")
+        # HKEx 在周末及香港公众假期不发布印花税率，属正常现象，不当作错误。
+        if _is_hk_trading_day(date_str):
+            errors.append(f"HKEx: 未获取到印花税率数据 (日期 {date_str})")
+        else:
+            logger.info(
+                "[RE] HKEx 在 %s 非交易日(周末/香港公众假期), "
+                "无印花税率数据, 跳过",
+                date_str,
+            )
         return {}
-    if not data.get("rates"):
-        errors.append(f"HKEx: 印花税率数据为空 (日期 {date_str})")
 
     got_date = str(data.get("date", ""))
-    if got_date and got_date != date_str:
+
+    # 非交易日: HKEx 不会发布当日汇率, 抓到的一定是上一交易日的数据,
+    # 直接丢弃, 不展示以免误导用户。
+    if not _is_hk_trading_day(date_str):
+        logger.info(
+            "[RE] HKEx 在 %s 非交易日, 丢弃抓到的上一交易日(%s)数据, "
+            "不展示以免误导",
+            date_str, got_date,
+        )
+        return {}
+
+    # 以下为交易日: 必须拿到当日数据, 否则记错
+    if not data.get("rates"):
+        errors.append(f"HKEx: 印花税率数据为空 (日期 {date_str})")
+    elif got_date and got_date != date_str:
         msg = f"HKEx: 汇率不是当日的 (取得 {got_date}, 期望 {date_str})"
-        if _is_business_day(date_str):
-            errors.append(msg)
-            logger.warning("[RE] %s", msg)
-        else:
-            logger.info("[RE] %s (目标日期非工作日, 仅记录)", msg)
+        errors.append(msg)
+        logger.warning("[RE] %s", msg)
     return data
 
 
@@ -683,10 +728,20 @@ def process_rate_export(
     logger.info("[RE] 生成自定义汇率: %s (%d 行)", custom_path, len(custom_rows))
     print(f"[RE] 生成自定义汇率: {custom_path} ({len(custom_rows)} 行)")
 
-    exchange_path = out_dir / f"交易所汇率{yymmdd}.xlsx"
-    _write_xlsx(exchange_rows, exchange_path, date_val)
-    logger.info("[RE] 生成交易所汇率: %s (%d 行)", exchange_path, len(exchange_rows))
-    print(f"[RE] 生成交易所汇率: {exchange_path} ({len(exchange_rows)} 行)")
+    # 仅在有实际交易所汇率时生成交易所汇率.xlsx（非交易日/HKEx 无数据时
+    # 不生成该文件，也不作为附件发送，避免误导）。
+    exchange_path = None
+    if exchange_rows:
+        exchange_path = out_dir / f"交易所汇率{yymmdd}.xlsx"
+        _write_xlsx(exchange_rows, exchange_path, date_val)
+        logger.info(
+            "[RE] 生成交易所汇率: %s (%d 行)", exchange_path, len(exchange_rows)
+        )
+        print(f"[RE] 生成交易所汇率: {exchange_path} ({len(exchange_rows)} 行)")
+    else:
+        logger.info(
+            "[RE] 无交易所汇率数据(HKEx 无数据/非交易日), 不生成交易所汇率.xlsx"
+        )
 
     if errors and send_error_notify:
         error_lines = [f"【汇率导出异常 {date_str}】"]

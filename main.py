@@ -278,7 +278,8 @@ def _build_email_html(result: dict) -> str:
     parts.append("<h3 style='color: #2c3e50;'>附件</h3>")
     parts.append("<ul>")
     parts.append(f"<li>自定义汇率{date_str[2:]}.xlsx — BOCHK 来源，按公式计算</li>")
-    parts.append(f"<li>交易所汇率{date_str[2:]}.xlsx — HKEx 印花税率</li>")
+    if result.get("exchange_path"):
+        parts.append(f"<li>交易所汇率{date_str[2:]}.xlsx — HKEx 印花税率</li>")
     parts.append("</ul>")
 
     parts.append(
@@ -455,7 +456,9 @@ def main() -> None:
     # 3. 正常：构建邮件正文并发送
     html_body = _build_email_html(result)
     subject = f"汇率报告 — {result['date_val'].strftime('%Y-%m-%d')}"
-    attachments = [result["custom_path"], result["exchange_path"]]
+    attachments = [
+        p for p in (result["custom_path"], result["exchange_path"]) if p
+    ]
 
     logger.info("发送邮件到 %s: %s", receiver, subject)
     send_mail(

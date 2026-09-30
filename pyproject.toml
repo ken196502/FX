@@ -9,6 +9,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "openpyxl>=3.1",
     "xlrd>=2.0",
+    "holidays>=0.30",
 ]
 
 [project.scripts]
