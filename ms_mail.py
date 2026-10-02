@@ -10,7 +10,8 @@ ms_mail.py - 通过 Microsoft Graph API 发送邮件
   MS_CLIENT_ID     - 应用注册的 client ID
   MS_CLIENT_SECRET - 应用注册的 client secret
   SENDER           - 发件邮箱地址
-  FX_RECIEVER      - 收件邮箱地址
+  FX_RECIEVER      - 收件邮箱地址（完整汇率报告）
+  BOC_RECIEVER     - 收件邮箱地址（仅自定义汇率，BOCHK 来源）
 """
 
 from __future__ import annotations

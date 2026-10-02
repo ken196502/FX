@@ -6,6 +6,12 @@ main.py - FX 汇率邮件发送入口
     uv run fxmail              # 发送今日汇率邮件
     uv run fxmail --date 20260930  # 发送指定日期汇率邮件
 
+收件人（环境变量，至少配置其一，多个地址用 , 或 ; 分隔）：
+    FX_RECIEVER   - 完整方案：自定义汇率 + 交易所汇率（含 HKEx 校验）
+    BOC_RECIEVER  - 仅自定义汇率（只抓 BOCHK，不抓 HKEx，不校验交易所汇率）
+    两者都配置时，一次运行会给两边各发一封：FX_RECIEVER 收完整报告，
+    BOC_RECIEVER 只收自定义汇率部分。
+
 流程：
     1. 从 BOCHK / HKEx 网站获取汇率
     2. 按 TFISF Excel 公式计算自定义汇率
@@ -26,6 +32,7 @@ import argparse
 import datetime as dt
 import logging
 import os
+import re
 import sys
 import traceback
 from pathlib import Path
@@ -59,6 +66,23 @@ def _env(key: str) -> str:
     return os.getenv(key, "").strip().strip('"').strip("'")
 
 
+def _recipients(*keys: str) -> list[str]:
+    """读取收件人环境变量，支持多个地址用 , 或 ; 分隔。
+
+    Args:
+        *keys: 依次尝试的环境变量名，第一个非空者生效
+
+    Returns:
+        收件邮箱地址列表，未配置时为空列表
+    """
+    raw = ""
+    for key in keys:
+        raw = _env(key)
+        if raw:
+            break
+    return [addr.strip() for addr in re.split(r"[,;]", raw) if addr.strip()]
+
+
 # -----------------------------------------------------------------------
 # 邮件正文构建
 # -----------------------------------------------------------------------
@@ -82,11 +106,12 @@ def _link(url: str, text: str | None = None) -> str:
     )
 
 
-def _build_sources_html(result: dict) -> str:
+def _build_sources_html(result: dict, include_exchange: bool = True) -> str:
     """构建「数据来源」区块，列出各数据项的来源页面 URL。
 
     Args:
         result: process_rate_export 返回的结果字典
+        include_exchange: 是否列出交易所汇率（HKEx）来源
 
     Returns:
         HTML 片段字符串
@@ -106,13 +131,16 @@ def _build_sources_html(result: dict) -> str:
             BOCHK_USDRATES_PAGE,
             "中銀香港 — 各類貨幣兌美元電匯牌價",
         ),
-        (
-            "交易所汇率（印花税率）",
-            HKEX_STAMPFX_URL,
-            "HKEx — 用於計算印花稅的匯率",
-        ),
     ]
-    if xls_url:
+    if include_exchange:
+        sources.append(
+            (
+                "交易所汇率（印花税率）",
+                HKEX_STAMPFX_URL,
+                "HKEx — 用於計算印花稅的匯率",
+            )
+        )
+    if xls_url and include_exchange:
         label = f"HKEx — 印花税率 Excel 文件（{hkex_date}）" if hkex_date \
             else "HKEx — 印花税率 Excel 文件"
         sources.append(("交易所汇率（原始数据文件）", xls_url, label))
@@ -139,11 +167,18 @@ def _build_sources_html(result: dict) -> str:
     return "".join(parts)
 
 
-def _build_email_html(result: dict) -> str:
+def _build_email_html(
+    result: dict,
+    include_exchange: bool = True,
+    errors: list[str] | None = None,
+) -> str:
     """构建邮件 HTML 正文，包含公式说明和计算结果。
 
     Args:
         result: process_rate_export 返回的结果字典
+        include_exchange: 是否包含交易所汇率（HKEx）区块，
+            False 时只展示自定义汇率部分
+        errors: 覆盖正文顶部的异常提示列表，None 则用 result["errors"]
 
     Returns:
         HTML 格式的邮件正文
@@ -155,7 +190,7 @@ def _build_email_html(result: dict) -> str:
     bochk_hkd_raw = result["bochk_hkd_raw"]
     bochk_usd_raw = result["bochk_usd_raw"]
     hkex_data = result["hkex_data"]
-    errors = result["errors"]
+    errors = result["errors"] if errors is None else errors
 
     date_display = date_val.strftime("%Y-%m-%d")
 
@@ -237,6 +272,17 @@ def _build_email_html(result: dict) -> str:
 
     # 交易所汇率
     parts.append("<h3 style='color: #2c3e50;'>交易所汇率（HKEx 印花税率）</h3>")
+    if not include_exchange:
+        parts.append(
+            "<p style='color: #999;'>"
+            "本邮件只包含自定义汇率（BOCHK），不含交易所汇率。</p>"
+        )
+        parts.append(_build_sources_html(result, include_exchange=False))
+        parts.append(_build_attachments_html(result, include_exchange=False))
+        parts.append(_build_signature_html())
+        parts.append("</body></html>")
+        return "".join(parts)
+
     hkex_links = _link(HKEX_STAMPFX_URL, "HKEx 用於計算印花稅的匯率")
     hkex_xls = (hkex_data or {}).get("xls_url", "")
     if hkex_xls:
@@ -272,25 +318,54 @@ def _build_email_html(result: dict) -> str:
         parts.append("<p style='color: #999;'>无交易所汇率数据</p>")
 
     # 数据来源
-    parts.append(_build_sources_html(result))
+    parts.append(_build_sources_html(result, include_exchange=include_exchange))
 
     # 附件说明
-    parts.append("<h3 style='color: #2c3e50;'>附件</h3>")
-    parts.append("<ul>")
-    parts.append(f"<li>自定义汇率{date_str[2:]}.xlsx — BOCHK 来源，按公式计算</li>")
-    if result.get("exchange_path"):
-        parts.append(f"<li>交易所汇率{date_str[2:]}.xlsx — HKEx 印花税率</li>")
-    parts.append("</ul>")
+    parts.append(_build_attachments_html(result, include_exchange=include_exchange))
 
-    parts.append(
+    parts.append(_build_signature_html())
+    parts.append("</body></html>")
+
+    return "".join(parts)
+
+
+def _build_attachments_html(
+    result: dict,
+    include_exchange: bool = True,
+) -> str:
+    """构建「附件」区块，列出本次邮件附带的 xlsx 文件名。
+
+    Args:
+        result: process_rate_export 返回的结果字典
+        include_exchange: 是否列出交易所汇率附件
+
+    Returns:
+        HTML 片段字符串
+    """
+    yymmdd = result["date_str"][2:]
+    parts = [
+        "<h3 style='color: #2c3e50;'>附件</h3>",
+        "<ul>",
+        f"<li>自定义汇率{yymmdd}.xlsx — BOCHK 来源，按公式计算</li>",
+    ]
+    if include_exchange and result.get("exchange_path"):
+        parts.append(f"<li>交易所汇率{yymmdd}.xlsx — HKEx 印花税率</li>")
+    parts.append("</ul>")
+    return "".join(parts)
+
+
+def _build_signature_html() -> str:
+    """构建邮件末尾的自动发送签名。
+
+    Returns:
+        HTML 片段字符串
+    """
+    return (
         f"<hr style='border: none; border-top: 1px solid #ddd; margin: 20px 0;'>"
         f"<p style='color: #999; font-size: 12px;'>"
         f"此邮件由系统自动发送 — {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         f"</p>"
     )
-    parts.append("</body></html>")
-
-    return "".join(parts)
 
 
 def _date_display(date_str: str) -> str:
@@ -381,6 +456,64 @@ def _find_raw_rate(
 
 
 # -----------------------------------------------------------------------
+# 邮件发送
+# -----------------------------------------------------------------------
+
+def _send_rate_mail(
+    recipients: list[str],
+    subject: str,
+    body_html: str,
+    attachments: list[Path],
+) -> None:
+    """发送汇率邮件（带 xlsx 附件）。
+
+    Args:
+        recipients: 收件邮箱地址列表
+        subject: 邮件主题
+        body_html: 邮件正文 HTML
+        attachments: 附件路径列表
+    """
+    logger.info("[FX] 发送邮件到 %s: %s", ", ".join(recipients), subject)
+    send_mail(
+        subject=subject,
+        body_html=body_html,
+        recipients=recipients,
+        attachments=attachments,
+    )
+    print(f"✅ 邮件已发送到 {', '.join(recipients)}: {subject}")
+
+
+def _send_error_report(
+    recipients: list[str],
+    errors: list[str],
+    date_str: str,
+    traceback_text: str = "",
+) -> None:
+    """发送数据异常的错误报告邮件（不带汇率附件）。
+
+    Args:
+        recipients: 收件邮箱地址列表
+        errors: 错误信息列表
+        date_str: 目标日期 YYYYMMDD
+        traceback_text: 异常堆栈文本，可为空
+    """
+    subject = f"【错误报告】汇率报告 — {_date_display(date_str)} 数据异常"
+    html_body = _build_error_email_html(errors, date_str, traceback_text)
+
+    logger.error("发送错误报告邮件到 %s: %s", ", ".join(recipients), subject)
+    send_mail(
+        subject=subject,
+        body_html=html_body,
+        recipients=recipients,
+        attachments=None,
+    )
+    print(
+        f"⚠ 错误报告邮件已发送到 {', '.join(recipients)}: {subject}",
+        file=sys.stderr,
+    )
+
+
+# -----------------------------------------------------------------------
 # 主入口
 # -----------------------------------------------------------------------
 
@@ -407,12 +540,20 @@ def main() -> None:
         print(f"错误: 日期格式不正确 {date_str} (应为 YYYYMMDD)", file=sys.stderr)
         sys.exit(1)
 
-    receiver = _env("FX_RECIEVER")
-    if not receiver:
-        print("错误: FX_RECIEVER 未配置", file=sys.stderr)
+    fx_recipients = _recipients("FX_RECIEVER")
+    # BOC_RECIEVER 只接收自定义汇率（BOCHK），不依赖 HKEx 数据
+    boc_recipients = _recipients("BOC_RECIEVER", "BOC_RECEIVER")
+    if not fx_recipients and not boc_recipients:
+        print("错误: FX_RECIEVER / BOC_RECIEVER 均未配置", file=sys.stderr)
         sys.exit(1)
 
-    logger.info("===== FX Mail 开始, date=%s =====", date_str)
+    # FX_RECIEVER 走完整方案（含 HKEx），只有它时才抓交易所汇率
+    include_hkex = bool(fx_recipients)
+
+    logger.info(
+        "===== FX Mail 开始, date=%s, mode=%s =====",
+        date_str, "完整汇率" if include_hkex else "仅自定义汇率(BOCHK)",
+    )
 
     # 1. 获取汇率并生成 Excel（异常不中断，统一收集为错误）
     result: dict | None = None
@@ -422,6 +563,7 @@ def main() -> None:
         result = process_rate_export(
             date_str=date_str,
             send_error_notify=not args.no_wechat,
+            include_hkex=include_hkex,
         )
         errors = list(result.get("errors") or [])
     except Exception as exc:
@@ -437,37 +579,48 @@ def main() -> None:
             except Exception as we:
                 logger.error("[FX] 企业微信错误通知发送失败: %s", we)
 
-    # 2. 有错误则只发错误报告邮件（不发汇率邮件，也不带任何汇率附件）
-    if errors:
-        subject = f"【错误报告】汇率报告 — {_date_display(date_str)} 数据异常"
-        html_body = _build_error_email_html(errors, date_str, tb_text)
+    failed = False
 
-        logger.error("发送错误报告邮件到 %s: %s", receiver, subject)
-        send_mail(
-            subject=subject,
-            body_html=html_body,
-            recipients=[receiver],
-            attachments=None,
-        )
-        print(f"⚠ 错误报告邮件已发送到 {receiver}: {subject}", file=sys.stderr)
+    # 2. FX_RECIEVER: 原有方案 — 自定义汇率 + 交易所汇率（含 HKEx 校验）
+    if fx_recipients:
+        if errors:
+            # 有错误则只发错误报告邮件（不发汇率邮件，也不带任何汇率附件）
+            _send_error_report(fx_recipients, errors, date_str, tb_text)
+            failed = True
+        else:
+            html_body = _build_email_html(result)
+            subject = f"汇率报告 — {result['date_val'].strftime('%Y-%m-%d')}"
+            attachments = [
+                p for p in (result["custom_path"], result["exchange_path"]) if p
+            ]
+            _send_rate_mail(
+                fx_recipients, subject, html_body, attachments,
+            )
+
+    # 3. BOC_RECIEVER: 只发自定义汇率 — HKEx 的异常不影响该邮件
+    if boc_recipients:
+        boc_errors = [e for e in errors if not e.startswith("HKEx")]
+        if boc_errors:
+            _send_error_report(boc_recipients, boc_errors, date_str, tb_text)
+            failed = True
+        else:
+            html_body = _build_email_html(
+                result, include_exchange=False, errors=[],
+            )
+            subject = (
+                f"汇率报告 — {result['date_val'].strftime('%Y-%m-%d')}"
+                f"（仅自定义汇率）"
+            )
+            _send_rate_mail(
+                boc_recipients,
+                subject,
+                html_body,
+                [result["custom_path"]] if result["custom_path"] else [],
+            )
+
+    if failed:
         logger.info("===== FX Mail 异常结束 =====")
         sys.exit(1)
-
-    # 3. 正常：构建邮件正文并发送
-    html_body = _build_email_html(result)
-    subject = f"汇率报告 — {result['date_val'].strftime('%Y-%m-%d')}"
-    attachments = [
-        p for p in (result["custom_path"], result["exchange_path"]) if p
-    ]
-
-    logger.info("发送邮件到 %s: %s", receiver, subject)
-    send_mail(
-        subject=subject,
-        body_html=html_body,
-        recipients=[receiver],
-        attachments=attachments,
-    )
-    print(f"✅ 邮件已发送到 {receiver}: {subject}")
 
     logger.info("===== FX Mail 完成 =====")
 

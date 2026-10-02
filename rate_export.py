@@ -669,14 +669,17 @@ def process_rate_export(
     mailbox: str | None = None,
     output_dir: str | None = None,
     send_error_notify: bool = True,
+    include_hkex: bool = True,
 ) -> dict:
-    """从 BOCHK 获取汇率并按 TFISF Excel 公式计算自定义汇率，生成两个 xlsx 文件。
+    """从 BOCHK 获取汇率并按 TFISF Excel 公式计算自定义汇率，生成 xlsx 文件。
 
     Args:
         date_str: YYYYMMDD 格式日期，None 表示今天
         mailbox: 保留兼容，当前未使用
         output_dir: 输出目录，默认 ./temp
         send_error_notify: 出错时是否发送企业微信通知，默认 True
+        include_hkex: 是否抓取 HKEx 印花税率并生成交易所汇率.xlsx，
+            默认 True（完整方案）；False 时只抓 BOCHK，只生成自定义汇率
 
     Returns:
         包含以下键的字典：
@@ -712,9 +715,14 @@ def process_rate_export(
     bochk_usd_raw = _bochk_usd_to_raw_dict(bochk_usd_rates)
     logger.info("[RE] BOCHK-USD: %d 个货币对", len(bochk_usd_raw))
 
-    hkex_data = _collect_hkex_rates(date_str, errors)
-    hkex_rows = _hkex_to_rows(hkex_data)
-    logger.info("[RE] HKEx: %d 条汇率", len(hkex_rows))
+    hkex_data: dict = {}
+    hkex_rows: list[dict] = []
+    if include_hkex:
+        hkex_data = _collect_hkex_rates(date_str, errors)
+        hkex_rows = _hkex_to_rows(hkex_data)
+        logger.info("[RE] HKEx: %d 条汇率", len(hkex_rows))
+    else:
+        logger.info("[RE] 仅 BOCHK 模式: 跳过 HKEx 印花税率抓取")
 
     custom_rows = _compute_custom_rows(bochk_hkd_raw, bochk_usd_raw)
     custom_rows = _filter_rows(custom_rows)
