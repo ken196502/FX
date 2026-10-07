@@ -31,6 +31,7 @@ rate_export.py - 汇率整合导出
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import re
@@ -46,7 +47,7 @@ from web_rates import (
     fetch_bochk_usdrates,
     fetch_hkex_stampfx,
 )
-from web_shot import capture_rate_pages
+from web_shot import resolve_rate_page_shots
 
 logger = logging.getLogger(__name__)
 
@@ -306,7 +307,10 @@ def _check_update_date(
         logger.info("[RE] %s (目标日期非交易日, 仅记录)", msg)
 
 
-def _collect_bochk_rates(date_str: str, errors: list[str]) -> list[dict]:
+def _collect_bochk_rates(
+    date_str: str,
+    errors: list[str],
+) -> tuple[list[dict], str]:
     """从 BOCHK 网站获取港币电汇牌价。
 
     Args:
@@ -314,7 +318,8 @@ def _collect_bochk_rates(date_str: str, errors: list[str]) -> list[dict]:
         errors: 错误信息收集列表
 
     Returns:
-        汇率字典列表，每项含 currency / sell / buy
+        (汇率字典列表, 页面资料更新时间字符串)
+        汇率字典每项含 currency / sell / buy
     """
     data = _fetch_safe("BOCHK 港币电汇牌价", errors, fetch_bochk_hkdrates)
     rates = data.get("rates", [])
@@ -323,10 +328,13 @@ def _collect_bochk_rates(date_str: str, errors: list[str]) -> list[dict]:
     _check_update_date(
         "BOCHK 港币电汇牌价", date_str, data.get("update_time", ""), errors,
     )
-    return rates
+    return rates, data.get("update_time", "")
 
 
-def _collect_bochk_usd_rates(date_str: str, errors: list[str]) -> list[dict]:
+def _collect_bochk_usd_rates(
+    date_str: str,
+    errors: list[str],
+) -> tuple[list[dict], str]:
     """从 BOCHK 网站获取美元电汇牌价。
 
     美元牌价页面提供各币种兑美元的汇率，
@@ -337,7 +345,7 @@ def _collect_bochk_usd_rates(date_str: str, errors: list[str]) -> list[dict]:
         errors: 错误信息收集列表
 
     Returns:
-        汇率字典列表，每项含 currency / sell / buy
+        (汇率字典列表, 页面资料更新时间字符串)
     """
     data = _fetch_safe("BOCHK 美元电汇牌价", errors, fetch_bochk_usdrates)
     rates = data.get("rates", [])
@@ -346,10 +354,13 @@ def _collect_bochk_usd_rates(date_str: str, errors: list[str]) -> list[dict]:
     _check_update_date(
         "BOCHK 美元电汇牌价", date_str, data.get("update_time", ""), errors,
     )
-    return rates
+    return rates, data.get("update_time", "")
 
 
-def _collect_bochk_fx_rates(date_str: str, errors: list[str]) -> list[dict]:
+def _collect_bochk_fx_rates(
+    date_str: str,
+    errors: list[str],
+) -> tuple[list[dict], str]:
     """从 BOCHK 网站获取港币现钞牌价。
 
     现钞牌价页包含电汇牌价页没有的币种（如韓國圜 KRW、新台幣 TWD），
@@ -360,7 +371,7 @@ def _collect_bochk_fx_rates(date_str: str, errors: list[str]) -> list[dict]:
         errors: 错误信息收集列表
 
     Returns:
-        汇率字典列表，每项含 currency / sell / buy
+        (汇率字典列表, 页面资料更新时间字符串)
     """
     data = _fetch_safe("BOCHK 港币现钞牌价", errors, fetch_bochk_fxrates)
     rates = data.get("rates", [])
@@ -369,7 +380,7 @@ def _collect_bochk_fx_rates(date_str: str, errors: list[str]) -> list[dict]:
     _check_update_date(
         "BOCHK 港币现钞牌价", date_str, data.get("update_time", ""), errors,
     )
-    return rates
+    return rates, data.get("update_time", "")
 
 
 def _collect_hkex_rates(date_str: str, errors: list[str]) -> dict:
@@ -763,6 +774,101 @@ def _short_yymmdd(date_str: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# 当日汇率快照（同日多次运行时复用，避免重复抓取 BOCHK）
+# ---------------------------------------------------------------------------
+
+def _snapshot_path(out_dir: Path, date_str: str) -> Path:
+    """当日自定义汇率快照文件路径。
+
+    Args:
+        out_dir: 输出目录
+        date_str: 目标日期 YYYYMMDD
+
+    Returns:
+        快照 json 文件路径
+    """
+    return out_dir / f"custom_snapshot_{date_str}.json"
+
+
+def _load_snapshot(snapshot_path: Path, date_str: str) -> dict | None:
+    """读取当日已生成的自定义汇率快照。
+
+    快照不存在、损坏、日期不匹配或无有效数据时返回 None，
+    调用方据此回退到重新抓取 BOCHK。
+
+    Args:
+        snapshot_path: 快照文件路径
+        date_str: 目标日期 YYYYMMDD
+
+    Returns:
+        快照字典，不可用时返回 None
+    """
+    if not snapshot_path.exists():
+        return None
+    try:
+        data = json.loads(snapshot_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning(
+            "[RE] 当日汇率快照读取失败，将重新抓取 BOCHK: %s (%s)",
+            snapshot_path.name, exc,
+        )
+        return None
+    if not isinstance(data, dict) or data.get("date_str") != date_str:
+        logger.warning(
+            "[RE] 当日汇率快照日期不匹配(exp=%s)，将重新抓取 BOCHK",
+            date_str,
+        )
+        return None
+    rows = data.get("custom_rows")
+    if not isinstance(rows, list) or not rows:
+        logger.warning("[RE] 当日汇率快照无有效数据，将重新抓取 BOCHK")
+        return None
+    return data
+
+
+def _save_snapshot(
+    snapshot_path: Path,
+    date_str: str,
+    custom_rows: list[dict],
+    bochk_hkd_raw: dict,
+    bochk_usd_raw: dict,
+    bochk_fx_raw: dict,
+    bochk_update_times: dict[str, str],
+) -> None:
+    """写入当日自定义汇率快照，供同日后续运行复用。
+
+    Args:
+        snapshot_path: 快照文件路径
+        date_str: 目标日期 YYYYMMDD
+        custom_rows: 自定义汇率行列表
+        bochk_hkd_raw: 港币电汇牌价原始字典
+        bochk_usd_raw: 美元电汇牌价原始字典
+        bochk_fx_raw: 港币现钞牌价原始字典
+        bochk_update_times: 三个牌价页的资料更新时间
+    """
+    payload = {
+        "date_str": date_str,
+        "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+        "custom_rows": custom_rows,
+        "bochk_hkd_raw": bochk_hkd_raw,
+        "bochk_usd_raw": bochk_usd_raw,
+        "bochk_fx_raw": bochk_fx_raw,
+        "bochk_update_times": bochk_update_times,
+    }
+    try:
+        snapshot_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.info("[RE] 已写入当日汇率快照: %s", snapshot_path.name)
+    except Exception as exc:
+        logger.warning(
+            "[RE] 写入当日汇率快照失败(不影响本次发送): %s (%s)",
+            snapshot_path.name, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -773,8 +879,14 @@ def process_rate_export(
     send_error_notify: bool = True,
     include_hkex: bool = True,
     capture_screenshots: bool = True,
+    reuse_daily: bool = True,
 ) -> dict:
     """从 BOCHK 获取汇率并按 TFISF Excel 公式计算自定义汇率，生成 xlsx 文件。
+
+    当日已经跑过一次（例如先给 BOC_RECIEVER 发过自定义汇率）时，
+    默认直接复用当日快照中的自定义汇率与 BOCHK 截图，不再重新抓取
+    BOCHK；只有当日快照不存在时才真正抓取 BOCHK 页面。
+    HKEx 印花税率不受影响，每次都会按当日重新抓取。
 
     Args:
         date_str: YYYYMMDD 格式日期，None 表示今天
@@ -785,6 +897,8 @@ def process_rate_export(
             默认 True（完整方案）；False 时只抓 BOCHK，只生成自定义汇率
         capture_screenshots: 是否截图 BOCHK 牌价页面作为邮件附件，
             默认 True；截图失败只记录警告，不影响主流程
+        reuse_daily: 是否复用当日已生成的自定义汇率与截图，
+            默认 True；False 则强制重新抓取 BOCHK 并重新截图
 
     Returns:
         包含以下键的字典：
@@ -796,8 +910,12 @@ def process_rate_export(
           - exchange_rows: 交易所汇率行列表
           - bochk_hkd_raw: BOCHK 港币原始汇率字典
           - bochk_usd_raw: BOCHK 美元原始汇率字典
+          - bochk_fx_raw: BOCHK 现钞原始汇率字典
+          - bochk_update_times: BOCHK 三个牌价页的资料更新时间
+            {"HKD": ..., "USD": ..., "FX": ...}
           - hkex_data: HKEx 原始数据字典
-          - screenshots: BOCHK 页面截图列表，每项含 label / url / path
+          - screenshots: BOCHK 页面截图列表，每项含 label / url / path /
+            captured_at（截图时间 YYYY-MM-DD HH:MM）
           - errors: 错误信息列表
     """
     if date_str is None:
@@ -813,17 +931,47 @@ def process_rate_export(
 
     errors: list[str] = []
 
-    bochk_rates = _collect_bochk_rates(date_str, errors)
-    bochk_hkd_raw = _bochk_to_raw_dict(bochk_rates)
-    logger.info("[RE] BOCHK-HKD: %d 种货币", len(bochk_hkd_raw))
+    # 当日已生成过（如已给 BOC_RECIEVER 发过）则复用，不再抓 BOCHK
+    snapshot_path = _snapshot_path(out_dir, date_str)
+    snapshot = _load_snapshot(snapshot_path, date_str) if reuse_daily else None
+    # BOCHK 三个牌价页各自的「資料更新於香港時間」，用于声明数据/截图时点
+    bochk_update_times: dict[str, str] = {}
 
-    bochk_usd_rates = _collect_bochk_usd_rates(date_str, errors)
-    bochk_usd_raw = _bochk_usd_to_raw_dict(bochk_usd_rates)
-    logger.info("[RE] BOCHK-USD: %d 个货币对", len(bochk_usd_raw))
+    if snapshot:
+        custom_rows_raw = [
+            dict(r) for r in snapshot.get("custom_rows") or []
+            if isinstance(r, dict)
+        ]
+        bochk_hkd_raw = snapshot.get("bochk_hkd_raw") or {}
+        bochk_usd_raw = snapshot.get("bochk_usd_raw") or {}
+        bochk_fx_raw = snapshot.get("bochk_fx_raw") or {}
+        bochk_update_times = snapshot.get("bochk_update_times") or {}
+        logger.info(
+            "[RE] 复用当日已有自定义汇率(date=%s, 快照 %s)，跳过 BOCHK 抓取",
+            date_str, snapshot.get("created_at", ""),
+        )
+        print(
+            f"[RE] 复用当日自定义汇率快照: {snapshot_path.name} "
+            f"(生成于 {snapshot.get('created_at', '未知时间')})，不重新抓取 BOCHK"
+        )
+    else:
+        bochk_rates, upd_hkd = _collect_bochk_rates(date_str, errors)
+        bochk_hkd_raw = _bochk_to_raw_dict(bochk_rates)
+        logger.info("[RE] BOCHK-HKD: %d 种货币", len(bochk_hkd_raw))
 
-    bochk_fx_rates = _collect_bochk_fx_rates(date_str, errors)
-    bochk_fx_raw = _bochk_fx_to_raw_dict(bochk_fx_rates)
-    logger.info("[RE] BOCHK-FX: %d 种货币", len(bochk_fx_raw))
+        bochk_usd_rates, upd_usd = _collect_bochk_usd_rates(date_str, errors)
+        bochk_usd_raw = _bochk_usd_to_raw_dict(bochk_usd_rates)
+        logger.info("[RE] BOCHK-USD: %d 个货币对", len(bochk_usd_raw))
+
+        bochk_fx_rates, upd_fx = _collect_bochk_fx_rates(date_str, errors)
+        bochk_fx_raw = _bochk_fx_to_raw_dict(bochk_fx_rates)
+        logger.info("[RE] BOCHK-FX: %d 种货币", len(bochk_fx_raw))
+
+        bochk_update_times = {"HKD": upd_hkd, "USD": upd_usd, "FX": upd_fx}
+
+        custom_rows_raw = _compute_custom_rows(
+            bochk_hkd_raw, bochk_usd_raw, bochk_fx_raw,
+        )
 
     hkex_data: dict = {}
     hkex_rows: list[dict] = []
@@ -834,10 +982,7 @@ def process_rate_export(
     else:
         logger.info("[RE] 仅 BOCHK 模式: 跳过 HKEx 印花税率抓取")
 
-    custom_rows = _compute_custom_rows(
-        bochk_hkd_raw, bochk_usd_raw, bochk_fx_raw,
-    )
-    custom_rows = _filter_rows(custom_rows)
+    custom_rows = _filter_rows(custom_rows_raw)
     custom_rows = _sort_rows(custom_rows)
 
     missing = _missing_pairs(custom_rows)
@@ -853,9 +998,21 @@ def process_rate_export(
     exchange_rows = _sort_rows(exchange_rows)
 
     custom_path = out_dir / f"自定义汇率{yymmdd}.xlsx"
-    _write_xlsx(custom_rows, custom_path, date_val)
-    logger.info("[RE] 生成自定义汇率: %s (%d 行)", custom_path, len(custom_rows))
-    print(f"[RE] 生成自定义汇率: {custom_path} ({len(custom_rows)} 行)")
+    if snapshot:
+        # 复用快照时保留当日已生成的文件；文件缺失时才按快照数据重建
+        logger.info("[RE] 复用自定义汇率文件: %s (%d 行)", custom_path, len(custom_rows))
+        print(f"[RE] 复用自定义汇率文件: {custom_path} ({len(custom_rows)} 行)")
+    if not snapshot or not custom_path.exists():
+        _write_xlsx(custom_rows, custom_path, date_val)
+        logger.info("[RE] 生成自定义汇率: %s (%d 行)", custom_path, len(custom_rows))
+        print(f"[RE] 生成自定义汇率: {custom_path} ({len(custom_rows)} 行)")
+
+    if not snapshot:
+        _save_snapshot(
+            snapshot_path, date_str, custom_rows,
+            bochk_hkd_raw, bochk_usd_raw, bochk_fx_raw,
+            bochk_update_times,
+        )
 
     # 仅在有实际交易所汇率时生成交易所汇率.xlsx（非交易日/HKEx 无数据时
     # 不生成该文件，也不作为附件发送，避免误导）。
@@ -873,10 +1030,12 @@ def process_rate_export(
         )
 
     # BOCHK 页面截图（作为邮件附件，供人工核对当时页面数字）
-    # 截图失败只告警，不阻断邮件发送
+    # 当日已截过的页面直接复用，只对缺失的补截图；截图失败只告警
     screenshots: list[dict] = []
     if capture_screenshots:
-        screenshots = capture_rate_pages(date_str, out_dir)
+        screenshots = resolve_rate_page_shots(
+            date_str, out_dir, allow_reuse=reuse_daily,
+        )
         logger.info("[RE] BOCHK 页面截图: %d 张", len(screenshots))
         print(f"[RE] BOCHK 页面截图: {len(screenshots)} 张")
     else:
@@ -901,6 +1060,7 @@ def process_rate_export(
         "bochk_hkd_raw": bochk_hkd_raw,
         "bochk_usd_raw": bochk_usd_raw,
         "bochk_fx_raw": bochk_fx_raw,
+        "bochk_update_times": bochk_update_times,
         "hkex_data": hkex_data,
         "screenshots": screenshots,
         "errors": errors,

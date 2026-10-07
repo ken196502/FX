@@ -21,6 +21,15 @@ main.py - FX 汇率邮件发送入口
     4. 构建邮件正文（含公式和计算结果）
     5. 通过 MS Graph API 发送邮件到 FX_RECIEVER
 
+当日复用：
+    自定义汇率（含 自定义汇率yymmdd.xlsx 与 BOCHK 页面截图）以日期为维度
+    缓存到输出目录（默认 ./temp/custom_snapshot_yyyymmdd.json）。
+    同一天第二次及之后的运行（如先给 BOC_RECIEVER 发过、再给 FX_RECIEVER
+    发）会直接复用当日的自定义汇率与截图，不再重新抓取 BOCHK；
+    只有当日尚无缓存时才真正抓取 BOCHK 并截图。
+    需要强制重新抓取时用 --no-reuse。HKEx 印花税率每次都会按当日重新抓取。
+    当日截图会被保留到下一日运行的清理阶段，以便同日多次运行复用。
+
 异常策略：
     正常时只发汇率邮件，不发企业微信 webhook；
     出现任何异常（网页打不开 / 汇率获取不到 / 汇率不是当日）时，
@@ -63,6 +72,7 @@ from web_rates import (
     BOCHK_USDRATES_PAGE,
     HKEX_STAMPFX_URL,
 )
+from web_shot import cleanup_previous_shots
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,6 +80,10 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+# 自定义汇率 / 截图 / 当日快照的输出目录
+# 与 rate_export.process_rate_export 的默认输出目录保持一致
+_TEMP_DIR = Path.cwd() / "temp"
 
 
 def _env(key: str) -> str:
@@ -244,15 +258,6 @@ def _build_email_html(
     bochk_hkd_raw = result["bochk_hkd_raw"]
     bochk_usd_raw = result["bochk_usd_raw"]
     bochk_fx_raw = result.get("bochk_fx_raw") or {}
-    # 电汇牌价里没有、靠现钞牌价补充的币种（如 KRW）
-    fx_only_ccys = {
-        row["from_ccy"]
-        for row in custom_rows
-        if row["to_ccy"] == "HKD"
-        and row["from_ccy"] not in bochk_hkd_raw
-        and row["from_ccy"] in bochk_fx_raw
-    }
-    hkex_data = result["hkex_data"]
     errors = result["errors"] if errors is None else errors
 
     date_display = date_val.strftime("%Y-%m-%d")
@@ -284,15 +289,7 @@ def _build_email_html(
         "计算公式：<b>L (Buy) = F × Mark down</b>，"
         "<b>N (Sell) = H × Mark up</b>；"
         "F = BOCHK 客户卖出价(Bid)，H = BOCHK 客户买入价(Ask)。"
-        " 来源: "
-        f"{_link(BOCHK_HKDRATES_PAGE, 'BOCHK 港币电汇牌价')} / "
-        f"{_link(BOCHK_USDRATES_PAGE, 'BOCHK 美元电汇牌价')}"
-        + (
-            f" / {_link(BOCHK_FXRATES_PAGE, 'BOCHK 港币现钞牌价')}"
-            f"（{'、'.join(sorted(fx_only_ccys))} 取自现钞牌价）"
-            if fx_only_ccys else ""
-        )
-        + "</p>"
+        "（数据来源见文末「数据来源」）</p>"
     )
     _th = "border: 1px solid #ddd; padding: 8px; text-align: center;"
     _sub = "font-weight: normal; font-size: 11px; color: #555;"
@@ -350,28 +347,16 @@ def _build_email_html(
         )
     parts.append("</table>")
 
-    # 交易所汇率
-    parts.append("<h3 style='color: #2c3e50;'>交易所汇率（HKEx 印花税率）</h3>")
+    # 仅自定义汇率邮件：不输出交易所汇率章节（主题已注明「仅自定义汇率」）
     if not include_exchange:
-        parts.append(
-            "<p style='color: #999;'>"
-            "本邮件只包含自定义汇率（BOCHK），不含交易所汇率。</p>"
-        )
         parts.append(_build_sources_html(result, include_exchange=False))
         parts.append(_build_attachments_html(result, include_exchange=False))
         parts.append(_build_signature_html())
         parts.append("</body></html>")
         return "".join(parts)
 
-    hkex_links = _link(HKEX_STAMPFX_URL, "HKEx 用於計算印花稅的匯率")
-    hkex_xls = (hkex_data or {}).get("xls_url", "")
-    if hkex_xls:
-        hkex_links += f" ｜ {_link(hkex_xls, 'Excel 原始文件')}"
-    parts.append(
-        "<p style='color: #666; font-size: 13px;'>"
-        f"来源: {hkex_links}"
-        "</p>"
-    )
+    # 交易所汇率
+    parts.append("<h3 style='color: #2c3e50;'>交易所汇率（HKEx 印花税率）</h3>")
     if exchange_rows:
         parts.append(
             "<table style='border-collapse: collapse; width: 100%; margin: 10px 0;'>"
@@ -430,11 +415,41 @@ def _build_attachments_html(
     ]
     if include_exchange and result.get("exchange_path"):
         parts.append(f"<li>交易所汇率{yymmdd}.xlsx — HKEx 印花税率</li>")
-    for shot in result.get("screenshots") or []:
+    shots = result.get("screenshots") or []
+    for shot in shots:
+        captured = shot.get("captured_at", "")
+        suffix = f"（{captured} 截取）" if captured else ""
         parts.append(
-            f"<li>{shot['path'].name} — {shot['label']}页面截图</li>"
+            f"<li>{shot['path'].name} — {shot['label']}页面截图{suffix}</li>"
         )
     parts.append("</ul>")
+
+    # 声明截图与正文汇率取自同一时间点
+    if shots:
+        update_times = result.get("bochk_update_times") or {}
+        upd = (
+            update_times.get("HKD")
+            or update_times.get("USD")
+            or update_times.get("FX")
+            or ""
+        )
+        captured_times = sorted(
+            {s["captured_at"] for s in shots if s.get("captured_at")}
+        )
+        if len(captured_times) > 1:
+            shot_desc = f"{captured_times[0]} ~ {captured_times[-1]}"
+        elif captured_times:
+            shot_desc = captured_times[0]
+        else:
+            shot_desc = ""
+        upd_desc = f"页面「資料更新於香港時間 {upd}」" if upd else "同一批 BOCHK 牌价页面"
+        shot_part = f"，截图抓取于 {shot_desc}" if shot_desc else ""
+        parts.append(
+            "<p style='color: #666; font-size: 13px;'>"
+            f"以上页面截图与正文汇率取自同一时间点"
+            f"（{upd_desc}{shot_part}），"
+            "截图中的牌价数字与正文/附件中的自定义汇率一致。</p>"
+        )
     return "".join(parts)
 
 
@@ -577,24 +592,26 @@ def _send_rate_mail(
     return True
 
 
-def _cleanup_screenshots(result: dict | None) -> None:
-    """删除本地 BOCHK 页面截图文件。
+def _cleanup_old_screenshots(date_str: str) -> None:
+    """删除历史日期的 BOCHK 页面截图。
 
-    截图只是邮件的临时附件，邮件发出后本地副本不再需要，
-    避免每次运行都在 temp 目录堆积 png。删除失败只记录警告。
+    截图只是邮件的临时附件，但当日截图需要保留到当日所有邮件发完，
+    供同日后续运行复用（如 FX_RECIEVER 复用当日已给 BOC_RECIEVER
+    发过的截图），因此只在每次运行开始时清理早于目标日期的 png，
+    避免长期堆积。删除失败只记录警告。
 
     Args:
-        result: process_rate_export 返回的结果字典
+        date_str: 目标日期 YYYYMMDD，该日期及之后的截图保留
     """
-    if not result:
+    try:
+        removed = cleanup_previous_shots(_TEMP_DIR, date_str)
+    except Exception as exc:
+        logger.warning("[FX] 清理历史截图失败: %s", exc)
         return
-    for shot in result.get("screenshots") or []:
-        path: Path = shot["path"]
-        try:
-            path.unlink(missing_ok=True)
-            logger.info("[FX] 已删除本地截图: %s", path.name)
-        except Exception as exc:
-            logger.warning("[FX] 删除本地截图失败: %s (%s)", path, exc)
+    if removed:
+        logger.info(
+            "[FX] 已清理 %d 个历史日期(%s 之前)的 BOCHK 截图", removed, date_str,
+        )
 
 
 def _send_error_report(
@@ -643,6 +660,11 @@ def main() -> None:
         action="store_true",
         help="不发送企业微信错误通知",
     )
+    parser.add_argument(
+        "--no-reuse",
+        action="store_true",
+        help="不使用当日已生成的自定义汇率/截图缓存，强制重新抓取 BOCHK",
+    )
     args = parser.parse_args()
 
     date_str = args.date
@@ -670,11 +692,17 @@ def main() -> None:
     include_hkex = bool(fx_recipients)
 
     logger.info(
-        "===== FX Mail 开始, date=%s, mode=%s =====",
-        date_str, "完整汇率" if include_hkex else "仅自定义汇率(BOCHK)",
+        "===== FX Mail 开始, date=%s, mode=%s, reuse=%s =====",
+        date_str,
+        "完整汇率" if include_hkex else "仅自定义汇率(BOCHK)",
+        "否(强制重抓)" if args.no_reuse else "是",
     )
 
+    # 0. 先清理历史日期的截图（当日截图需保留供同日复用）
+    _cleanup_old_screenshots(date_str)
+
     # 1. 获取汇率并生成 Excel（异常不中断，统一收集为错误）
+    #    当日已有自定义汇率/截图时直接复用，不再抓取 BOCHK
     result: dict | None = None
     errors: list[str] = []
     tb_text = ""
@@ -683,6 +711,7 @@ def main() -> None:
             date_str=date_str,
             send_error_notify=not args.no_wechat,
             include_hkex=include_hkex,
+            reuse_daily=not args.no_reuse,
         )
         errors = list(result.get("errors") or [])
     except Exception as exc:
@@ -699,7 +728,6 @@ def main() -> None:
                 logger.error("[FX] 企业微信错误通知发送失败: %s", we)
 
     failed = False
-    mail_sent = False
 
     # 2. FX_RECIEVER: 原有方案 — 自定义汇率 + 交易所汇率（含 HKEx 校验）
     #    没有交易所汇率时（周末 / 香港公众假期，HKEx 不发布当日汇率，
@@ -733,9 +761,7 @@ def main() -> None:
             attachments += [
                 s["path"] for s in (result.get("screenshots") or [])
             ]
-            mail_sent = _send_rate_mail(
-                fx_recipients, subject, html_body, attachments,
-            )
+            _send_rate_mail(fx_recipients, subject, html_body, attachments)
 
     # 3. BOC_RECIEVER: 只发自定义汇率 — HKEx 的异常不影响该邮件
     if boc_recipients:
@@ -757,16 +783,7 @@ def main() -> None:
             boc_attachments += [
                 s["path"] for s in (result.get("screenshots") or [])
             ]
-            mail_sent = _send_rate_mail(
-                boc_recipients,
-                subject,
-                html_body,
-                boc_attachments,
-            )
-
-    # 4. 邮件已发出后删除本地截图（截图只是临时附件，无需保留）
-    if mail_sent:
-        _cleanup_screenshots(result)
+            _send_rate_mail(boc_recipients, subject, html_body, boc_attachments)
 
     if failed:
         logger.info("===== FX Mail 异常结束 =====")

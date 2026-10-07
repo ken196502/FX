@@ -80,18 +80,86 @@ def _launch_browser(pw):
     return None
 
 
-def capture_rate_pages(
+def _shot_time(path: Path) -> str:
+    """取截图的抓取时间（文件修改时间）。
+
+    Args:
+        path: 截图文件路径
+
+    Returns:
+        "YYYY-MM-DD HH:MM" 格式时间字符串
+    """
+    return dt.datetime.fromtimestamp(path.stat().st_mtime).strftime(
+        "%Y-%m-%d %H:%M"
+    )
+
+
+def _shot_path(output_dir: Path, prefix: str, date_str: str) -> Path:
+    """按统一命名规则生成截图文件路径。
+
+    Args:
+        output_dir: 截图保存目录
+        prefix: 文件名前缀（SHOT_TARGETS 第三项）
+        date_str: 日期字符串 YYYYMMDD
+
+    Returns:
+        截图文件路径
+    """
+    return Path(output_dir) / f"{prefix}_{date_str}.png"
+
+
+def existing_rate_page_shots(
     date_str: str,
     output_dir: str | Path,
 ) -> list[dict]:
-    """截图 BOCHK 三个牌价页面。
+    """返回当日已存在的 BOCHK 页面截图（不启动浏览器）。
+
+    用于同日多次运行时复用已生成的截图，避免重复打开浏览器截图。
 
     Args:
         date_str: 日期字符串 YYYYMMDD，用于文件名
         output_dir: 截图保存目录
 
     Returns:
-        [{"label": 中文标签, "url": 页面 URL, "path": Path}] 列表；
+        [{"label": 中文标签, "url": 页面 URL, "path": Path,
+          "captured_at": 截图时间 "YYYY-MM-DD HH:MM"}] 列表；
+        文件不存在或为空时该项不返回
+    """
+    out_dir = Path(output_dir)
+    results: list[dict] = []
+    for label, url, prefix in SHOT_TARGETS:
+        path = _shot_path(out_dir, prefix, date_str)
+        if path.exists() and path.stat().st_size > 0:
+            results.append({
+                "label": label,
+                "url": url,
+                "path": path,
+                "captured_at": _shot_time(path),
+            })
+    if results:
+        logger.info(
+            "[SHOT] 复用当日已有截图 %d 张: %s",
+            len(results), ", ".join(str(r["path"].name) for r in results),
+        )
+    return results
+
+
+def capture_rate_pages(
+    date_str: str,
+    output_dir: str | Path,
+    targets: tuple[tuple[str, str, str], ...] = SHOT_TARGETS,
+) -> list[dict]:
+    """截图 BOCHK 牌价页面。
+
+    Args:
+        date_str: 日期字符串 YYYYMMDD，用于文件名
+        output_dir: 截图保存目录
+        targets: 需要截图的页面列表，默认全部三个牌价页。
+            传入子集时只截缺失的页面，已有截图保持不动。
+
+    Returns:
+        [{"label": 中文标签, "url": 页面 URL, "path": Path,
+          "captured_at": 截图时间 "YYYY-MM-DD HH:MM"}] 列表；
         浏览器不可用或全部失败时返回空列表
     """
     out_dir = Path(output_dir)
@@ -110,8 +178,8 @@ def capture_rate_pages(
             if browser is None:
                 return []
             try:
-                for label, url, prefix in SHOT_TARGETS:
-                    path = out_dir / f"{prefix}_{date_str}.png"
+                for label, url, prefix in targets:
+                    path = _shot_path(out_dir, prefix, date_str)
                     try:
                         page = browser.new_page(viewport=_VIEWPORT)
                         try:
@@ -145,6 +213,7 @@ def capture_rate_pages(
                         "label": label,
                         "url": url,
                         "path": path,
+                        "captured_at": _shot_time(path),
                     })
             finally:
                 browser.close()
@@ -153,6 +222,83 @@ def capture_rate_pages(
         return results
 
     return results
+
+
+def resolve_rate_page_shots(
+    date_str: str,
+    output_dir: str | Path,
+    allow_reuse: bool = True,
+) -> list[dict]:
+    """获取当日 BOCHK 页面截图，优先复用已有截图。
+
+    当日已存在的截图直接复用（不再启动浏览器），只对缺失的页面重新截图，
+    便于同日多次运行共用同一批截图。
+
+    Args:
+        date_str: 日期字符串 YYYYMMDD
+        output_dir: 截图保存目录
+        allow_reuse: 是否允许复用当日已有截图，False 则全部重新截图
+
+    Returns:
+        截图信息列表，顺序与 SHOT_TARGETS 一致
+    """
+    out_dir = Path(output_dir)
+    shots = existing_rate_page_shots(date_str, out_dir) if allow_reuse else []
+    have = {s["path"].name for s in shots}
+    missing = tuple(
+        t for t in SHOT_TARGETS
+        if _shot_path(out_dir, t[2], date_str).name not in have
+    )
+    if missing:
+        logger.info(
+            "[SHOT] 当日仍有 %d 个页面无截图，开始补截图", len(missing),
+        )
+        shots.extend(capture_rate_pages(date_str, out_dir, targets=missing))
+
+    order = {
+        _shot_path(out_dir, prefix, date_str).name: idx
+        for idx, (_, _, prefix) in enumerate(SHOT_TARGETS)
+    }
+    return sorted(shots, key=lambda s: order.get(s["path"].name, len(order)))
+
+
+def cleanup_previous_shots(
+    output_dir: str | Path,
+    keep_date_str: str,
+) -> int:
+    """删除早于指定日期的 BOCHK 截图。
+
+    当日截图需要保留以便同日后续运行复用，因此只在每次运行开始时
+    清理历史日期的 png，避免在 temp 目录无限堆积。
+
+    Args:
+        output_dir: 截图保存目录
+        keep_date_str: 保留该日期（YYYYMMDD）及其之后的截图
+
+    Returns:
+        成功删除的文件数量
+    """
+    out_dir = Path(output_dir)
+    if not out_dir.exists():
+        return 0
+    prefixes = {prefix for _, _, prefix in SHOT_TARGETS}
+    removed = 0
+    for path in out_dir.glob("*.png"):
+        name = path.stem
+        if "_" not in name:
+            continue
+        prefix, _, date_part = name.rpartition("_")
+        if prefix not in prefixes or len(date_part) != 8 or not date_part.isdigit():
+            continue
+        if date_part >= keep_date_str:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+            logger.info("[SHOT] 已清理历史日期截图: %s", path.name)
+        except Exception as exc:
+            logger.warning("[SHOT] 清理截图失败: %s (%s)", path, exc)
+    return removed
 
 
 def capture_with_timestamp(
