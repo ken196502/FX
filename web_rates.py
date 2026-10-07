@@ -65,6 +65,7 @@ BOCHK_USDRATES_IFRAME = (
 # 面向用户的页面 URL（用于邮件正文展示来源链接）
 BOCHK_HKDRATES_PAGE = "https://www.bochk.com/tc/investment/rates/hkdrates.html"
 BOCHK_USDRATES_PAGE = "https://www.bochk.com/tc/investment/rates/usdrates.html"
+BOCHK_FXRATES_PAGE = "https://www.bochk.com/tc/investment/rates/fxrates.html"
 
 
 # ---------------------------------------------------------------------------

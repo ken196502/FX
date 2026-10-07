@@ -58,6 +58,7 @@ from rate_export import (
     process_rate_export,
 )
 from web_rates import (
+    BOCHK_FXRATES_PAGE,
     BOCHK_HKDRATES_PAGE,
     BOCHK_USDRATES_PAGE,
     HKEX_STAMPFX_URL,
@@ -164,6 +165,27 @@ def _build_sources_html(result: dict, include_exchange: bool = True) -> str:
             "中銀香港 — 各類貨幣兌美元電匯牌價",
         ),
     ]
+
+    # 电汇牌价没有、靠现钞牌价补充的币种（如 KRW）
+    bochk_hkd_raw = result.get("bochk_hkd_raw") or {}
+    bochk_fx_raw = result.get("bochk_fx_raw") or {}
+    fx_only_ccys = sorted(
+        row["from_ccy"]
+        for row in (result.get("custom_rows") or [])
+        if row["to_ccy"] == "HKD"
+        and row["from_ccy"] not in bochk_hkd_raw
+        and row["from_ccy"] in bochk_fx_raw
+    )
+    if fx_only_ccys:
+        sources.append(
+            (
+                f"自定义汇率（{'、'.join(fx_only_ccys)} 兑港元，"
+                "电汇牌价无此币种）",
+                BOCHK_FXRATES_PAGE,
+                "中銀香港 — 各類貨幣兌港元現鈔牌價",
+            )
+        )
+
     if include_exchange:
         sources.append(
             (
@@ -221,6 +243,15 @@ def _build_email_html(
     exchange_rows = result["exchange_rows"]
     bochk_hkd_raw = result["bochk_hkd_raw"]
     bochk_usd_raw = result["bochk_usd_raw"]
+    bochk_fx_raw = result.get("bochk_fx_raw") or {}
+    # 电汇牌价里没有、靠现钞牌价补充的币种（如 KRW）
+    fx_only_ccys = {
+        row["from_ccy"]
+        for row in custom_rows
+        if row["to_ccy"] == "HKD"
+        and row["from_ccy"] not in bochk_hkd_raw
+        and row["from_ccy"] in bochk_fx_raw
+    }
     hkex_data = result["hkex_data"]
     errors = result["errors"] if errors is None else errors
 
@@ -256,7 +287,12 @@ def _build_email_html(
         " 来源: "
         f"{_link(BOCHK_HKDRATES_PAGE, 'BOCHK 港币电汇牌价')} / "
         f"{_link(BOCHK_USDRATES_PAGE, 'BOCHK 美元电汇牌价')}"
-        "</p>"
+        + (
+            f" / {_link(BOCHK_FXRATES_PAGE, 'BOCHK 港币现钞牌价')}"
+            f"（{'、'.join(sorted(fx_only_ccys))} 取自现钞牌价）"
+            if fx_only_ccys else ""
+        )
+        + "</p>"
     )
     _th = "border: 1px solid #ddd; padding: 8px; text-align: center;"
     _sub = "font-weight: normal; font-size: 11px; color: #555;"
@@ -282,7 +318,9 @@ def _build_email_html(
     )
     for row in custom_rows:
         pair_key = f"{row['from_ccy']}/{row['to_ccy']}"
-        raw = _find_raw_rate(pair_key, bochk_hkd_raw, bochk_usd_raw)
+        raw = _find_raw_rate(
+            pair_key, bochk_hkd_raw, bochk_usd_raw, bochk_fx_raw,
+        )
         f_val = raw.get("bid", 0.0) if raw else 0.0
         h_val = raw.get("ask", 0.0) if raw else 0.0
         md, mu = MARKDOWN_FACTORS.get(pair_key, DEFAULT_MARKDOWN_FACTOR)
@@ -468,13 +506,17 @@ def _find_raw_rate(
     pair_key: str,
     bochk_hkd: dict[str, dict[str, float]],
     bochk_usd: dict[str, dict[str, float]],
+    bochk_fx: dict[str, dict[str, float]] | None = None,
 ) -> dict[str, float] | None:
     """从 BOCHK 原始汇率字典中查找指定币种对的汇率。
 
+    依次在港币电汇牌价、美元电汇牌价、港币现钞牌价中查找。
+
     Args:
         pair_key: 币种对字符串，如 "CNY/HKD" 或 "USD/CNY"
-        bochk_hkd: 港币牌价字典 {币种代码: {"bid": F, "ask": H}}
-        bochk_usd: 美元牌价字典 {"FROM/TO": {"bid": F, "ask": H}}
+        bochk_hkd: 港币电汇牌价字典 {币种代码: {"bid": F, "ask": H}}
+        bochk_usd: 美元电汇牌价字典 {"FROM/TO": {"bid": F, "ask": H}}
+        bochk_fx: 港币现钞牌价字典 {币种代码: {"bid": F, "ask": H}}，可选
 
     Returns:
         {"bid": float, "ask": float} 或 None
@@ -484,6 +526,8 @@ def _find_raw_rate(
         return bochk_hkd[from_ccy]
     if pair_key in bochk_usd:
         return bochk_usd[pair_key]
+    if bochk_fx and to_ccy == "HKD" and from_ccy in bochk_fx:
+        return bochk_fx[from_ccy]
     return None
 
 

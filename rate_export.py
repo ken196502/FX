@@ -41,6 +41,7 @@ from openpyxl.utils import get_column_letter
 
 from sc_infra import send_error
 from web_rates import (
+    fetch_bochk_fxrates,
     fetch_bochk_hkdrates,
     fetch_bochk_usdrates,
     fetch_hkex_stampfx,
@@ -121,6 +122,32 @@ BOCHK_CURRENCY_MAP: dict[str, str] = {
     "瑞典克郎": "SEK",
     "新加坡元": "SGD",
     "泰國銖": "THB",
+    "文萊元": "BND",
+    "南非蘭特": "ZAR",
+}
+
+# BOCHK 现钞牌价 货币中文名 -> ISO 币种代码
+# 现钞牌价页比电汇牌价页多出部分币种（如韓國圜 KRW、新台幣 TWD 等），
+# 电汇牌价取不到的币对从这里补充。
+BOCHK_FX_CURRENCY_MAP: dict[str, str] = {
+    "人民幣": "CNY",
+    "澳元": "AUD",
+    "加拿大元": "CAD",
+    "瑞士法郎": "CHF",
+    "歐羅": "EUR",
+    "英鎊": "GBP",
+    "日圓": "JPY",
+    "紐西蘭元": "NZD",
+    "新加坡元": "SGD",
+    "泰國銖": "THB",
+    "美元": "USD",
+    "印尼盾": "IDR",
+    "印度盧比": "INR",
+    "韓國圜": "KRW",
+    "澳門元": "MOP",
+    "菲律賓彼索": "PHP",
+    "俄羅斯盧布": "RUB",
+    "新台幣": "TWD",
     "文萊元": "BND",
     "南非蘭特": "ZAR",
 }
@@ -320,6 +347,29 @@ def _collect_bochk_usd_rates(date_str: str, errors: list[str]) -> list[dict]:
     return rates
 
 
+def _collect_bochk_fx_rates(date_str: str, errors: list[str]) -> list[dict]:
+    """从 BOCHK 网站获取港币现钞牌价。
+
+    现钞牌价页包含电汇牌价页没有的币种（如韓國圜 KRW、新台幣 TWD），
+    用于补充电汇牌价取不到的 XXX/HKD 币对。
+
+    Args:
+        date_str: 目标日期 YYYYMMDD，用于校验是否为当日汇率
+        errors: 错误信息收集列表
+
+    Returns:
+        汇率字典列表，每项含 currency / sell / buy
+    """
+    data = _fetch_safe("BOCHK 港币现钞牌价", errors, fetch_bochk_fxrates)
+    rates = data.get("rates", [])
+    if not rates:
+        errors.append("BOCHK-FX: 未获取到港币现钞牌价数据")
+    _check_update_date(
+        "BOCHK 港币现钞牌价", date_str, data.get("update_time", ""), errors,
+    )
+    return rates
+
+
 def _collect_hkex_rates(date_str: str, errors: list[str]) -> dict:
     """从 HKEx 网站获取印花税率汇率。
 
@@ -426,6 +476,30 @@ def _bochk_usd_to_raw_dict(
     return result
 
 
+def _bochk_fx_to_raw_dict(
+    rates: list[dict],
+) -> dict[str, dict[str, float]]:
+    """将 BOCHK 现钞牌价解析为 {币种代码: {"bid": F, "ask": H}} 字典。
+
+    Args:
+        rates: BOCHK 现钞牌价列表，每项含 currency / sell / buy
+
+    Returns:
+        {币种代码: {"bid": float, "ask": float}} 字典
+    """
+    result: dict[str, dict[str, float]] = {}
+    for r in rates:
+        ccy_name = r.get("currency", "")
+        ccy_code = BOCHK_FX_CURRENCY_MAP.get(ccy_name)
+        if not ccy_code:
+            logger.warning("[RE] BOCHK-FX 未知货币: %s, 跳过", ccy_name)
+            continue
+        bid = _to_float(r.get("sell"))
+        ask = _to_float(r.get("buy"))
+        result[ccy_code] = {"bid": bid, "ask": ask}
+    return result
+
+
 def _apply_markdown(
     pair_key: str,
     bid: float,
@@ -453,6 +527,7 @@ def _apply_markdown(
 def _compute_custom_rows(
     bochk_hkd: dict[str, dict[str, float]],
     bochk_usd: dict[str, dict[str, float]],
+    bochk_fx: dict[str, dict[str, float]] | None = None,
 ) -> list[dict]:
     """根据 BOCHK 原始汇率，参照 TFISF Excel 公式计算自定义汇率。
 
@@ -466,10 +541,13 @@ def _compute_custom_rows(
       - 各币种/HKD: 来自 BOCHK 港币电汇牌价
       - USD/CNY 等: 来自 BOCHK 美元电汇牌价
       USD/HKD 不会从美元牌价重复添加（港币牌价已有）
+      - 电汇牌价没有的币种（如 KRW）: 来自 BOCHK 港币现钞牌价，
+        仅在 RATE_PAIRS 显式配置了该币对时补充
 
     Args:
-        bochk_hkd: {币种代码: {"bid": F, "ask": H}} 港币牌价字典
-        bochk_usd: {"FROM/TO": {"bid": F, "ask": H}} 美元牌价字典
+        bochk_hkd: {币种代码: {"bid": F, "ask": H}} 港币电汇牌价字典
+        bochk_usd: {"FROM/TO": {"bid": F, "ask": H}} 美元电汇牌价字典
+        bochk_fx: {币种代码: {"bid": F, "ask": H}} 港币现钞牌价字典，可选
 
     Returns:
         模板行字典列表，含 from_ccy / to_ccy / unit / buy / sell
@@ -505,6 +583,25 @@ def _compute_custom_rows(
             "buy": buy,
             "sell": sell,
         })
+
+    # 3. 现钞牌价补充：电汇牌价没有的币种（如 KRW）
+    #    仅在 RATE_PAIRS 显式配置了该币对时补充，避免未配置白名单时
+    #    把现钞页的多余币种（IDR/INR/MOP/PHP/RUB/TWD 等）也导出。
+    if bochk_fx and RATE_PAIRS:
+        for ccy_code, val in bochk_fx.items():
+            pair_key = f"{ccy_code}/HKD"
+            if pair_key in seen or not _is_pair_allowed(ccy_code, "HKD"):
+                continue
+            seen.add(pair_key)
+            buy, sell = _apply_markdown(pair_key, val["bid"], val["ask"])
+            rows.append({
+                "from_ccy": ccy_code,
+                "to_ccy": "HKD",
+                "unit": 1,
+                "buy": buy,
+                "sell": sell,
+            })
+            logger.info("[RE] %s 由 BOCHK 现钞牌价补充", pair_key)
 
     return rows
 
@@ -565,6 +662,24 @@ def _filter_rows(rows: list[dict]) -> list[dict]:
         r for r in rows
         if _is_pair_allowed(r["from_ccy"], r["to_ccy"])
     ]
+
+
+def _missing_pairs(rows: list[dict]) -> list[str]:
+    """返回 RATE_PAIRS 中配置了、但实际没取到数据的币对。
+
+    RATE_PAIRS 只是过滤白名单，抓不到的币对会被静默丢掉；
+    本函数用于把这种情况显式暴露出来，避免再出现「配了却没输出」。
+
+    Args:
+        rows: 汇率行字典列表
+
+    Returns:
+        缺失的币对字符串列表，RATE_PAIRS 未配置时恒为空
+    """
+    if not RATE_PAIRS:
+        return []
+    got = {f"{r['from_ccy']}/{r['to_ccy']}" for r in rows}
+    return [p for p in RATE_PAIRS if p not in got]
 
 
 # ---------------------------------------------------------------------------
@@ -715,6 +830,10 @@ def process_rate_export(
     bochk_usd_raw = _bochk_usd_to_raw_dict(bochk_usd_rates)
     logger.info("[RE] BOCHK-USD: %d 个货币对", len(bochk_usd_raw))
 
+    bochk_fx_rates = _collect_bochk_fx_rates(date_str, errors)
+    bochk_fx_raw = _bochk_fx_to_raw_dict(bochk_fx_rates)
+    logger.info("[RE] BOCHK-FX: %d 种货币", len(bochk_fx_raw))
+
     hkex_data: dict = {}
     hkex_rows: list[dict] = []
     if include_hkex:
@@ -724,9 +843,20 @@ def process_rate_export(
     else:
         logger.info("[RE] 仅 BOCHK 模式: 跳过 HKEx 印花税率抓取")
 
-    custom_rows = _compute_custom_rows(bochk_hkd_raw, bochk_usd_raw)
+    custom_rows = _compute_custom_rows(
+        bochk_hkd_raw, bochk_usd_raw, bochk_fx_raw,
+    )
     custom_rows = _filter_rows(custom_rows)
     custom_rows = _sort_rows(custom_rows)
+
+    missing = _missing_pairs(custom_rows)
+    if missing:
+        msg = (
+            "RATE_PAIRS 中配置的币对未取到数据: " + ", ".join(missing) +
+            "（BOCHK 电汇/美元/现钞牌价均无该币对）"
+        )
+        errors.append(msg)
+        logger.warning("[RE] %s", msg)
 
     exchange_rows = _filter_rows(hkex_rows)
     exchange_rows = _sort_rows(exchange_rows)
@@ -769,6 +899,7 @@ def process_rate_export(
         "exchange_rows": exchange_rows,
         "bochk_hkd_raw": bochk_hkd_raw,
         "bochk_usd_raw": bochk_usd_raw,
+        "bochk_fx_raw": bochk_fx_raw,
         "hkex_data": hkex_data,
         "errors": errors,
     }
