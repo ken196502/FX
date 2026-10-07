@@ -10,6 +10,7 @@ dependencies = [
     "openpyxl>=3.1",
     "xlrd>=2.0",
     "holidays>=0.30",
+    "playwright>=1.63.0",
 ]
 
 [project.scripts]

@@ -76,6 +76,10 @@ def _guess_content_type(suffix: str) -> str:
         ".csv": "text/csv",
         ".pdf": "application/pdf",
         ".txt": "text/plain",
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".gif": "image/gif",
     }
     return mapping.get(suffix.lower(), "application/octet-stream")
 

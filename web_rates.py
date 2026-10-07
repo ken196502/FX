@@ -87,8 +87,9 @@ def fetch_hkex_stampfx(date_str: str | None = None) -> dict:
 
     Args:
         date_str: YYYYMMDD 格式日期，None 表示今天。
-            如果指定日期在日历中不存在（如周末/假日），
-            将查找日历中最近的之前的工作日。
+            只取该日期当天的汇率；页面日历中没有该日期
+            （周末 / 香港公众假期 / 当日尚未发布）时直接返回空字典，
+            不回退到其他日期。
 
     Returns:
         包含以下键的字典：
@@ -121,20 +122,15 @@ def fetch_hkex_stampfx(date_str: str | None = None) -> dict:
         logger.warning("[HKEX] 页面中未找到任何 xls 链接")
         return {}
 
-    # 找到目标日期或之前最近的工作日
+    # 只取目标日期当天的 xls；取不到就不取其他日期
     target = date_str
     matching = [lk for lk in links if lk[1] == target]
     if not matching:
-        # 查找 <= target 的最大日期
-        earlier = [lk for lk in links if lk[1] <= target]
-        if earlier:
-            earlier.sort(key=lambda x: x[1], reverse=True)
-            target = earlier[0][1]
-            matching = [earlier[0]]
-            logger.info("[HKEX] 目标日期 %s 无数据, 使用最近工作日 %s", date_str, target)
-        else:
-            logger.warning("[HKEX] 日历中无 <= %s 的日期", target)
-            return {}
+        logger.warning(
+            "[HKEX] 日历中没有 %s 的数据（非交易日或当日尚未发布），"
+            "不取其他日期", target,
+        )
+        return {}
 
     xls_path = matching[0][0]
     if xls_path.startswith("/"):

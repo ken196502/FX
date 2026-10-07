@@ -324,7 +324,17 @@ def _build_email_html(
         f_val = raw.get("bid", 0.0) if raw else 0.0
         h_val = raw.get("ask", 0.0) if raw else 0.0
         md, mu = MARKDOWN_FACTORS.get(pair_key, DEFAULT_MARKDOWN_FACTOR)
-        calc = f"L = {f_val:.6f} × {md} = {row['buy']:.6f}<br>N = {h_val:.6f} × {mu} = {row['sell']:.6f}"
+        # 因子为 1 时 Buy/Sell 就是 BOCHK 原始牌价，展示计算过程没有意义
+        if md == 1.0 and mu == 1.0:
+            calc = (
+                "<span style='color: #999;'>"
+                "— 无加减点，直接取 BOCHK 原始牌价</span>"
+            )
+        else:
+            calc = (
+                f"L = {f_val:.6f} × {md} = {row['buy']:.6f}"
+                f"<br>N = {h_val:.6f} × {mu} = {row['sell']:.6f}"
+            )
         parts.append(
             f"<tr>"
             f"<td style='border: 1px solid #ddd; padding: 8px;'>{row['from_ccy']}</td>"
@@ -420,6 +430,10 @@ def _build_attachments_html(
     ]
     if include_exchange and result.get("exchange_path"):
         parts.append(f"<li>交易所汇率{yymmdd}.xlsx — HKEx 印花税率</li>")
+    for shot in result.get("screenshots") or []:
+        parts.append(
+            f"<li>{shot['path'].name} — {shot['label']}页面截图</li>"
+        )
     parts.append("</ul>")
     return "".join(parts)
 
@@ -540,7 +554,7 @@ def _send_rate_mail(
     subject: str,
     body_html: str,
     attachments: list[Path],
-) -> None:
+) -> bool:
     """发送汇率邮件（带 xlsx 附件）。
 
     Args:
@@ -548,6 +562,9 @@ def _send_rate_mail(
         subject: 邮件主题
         body_html: 邮件正文 HTML
         attachments: 附件路径列表
+
+    Returns:
+        True 表示发送成功；发送失败时抛出异常
     """
     logger.info("[FX] 发送邮件到 %s: %s", ", ".join(recipients), subject)
     send_mail(
@@ -557,6 +574,27 @@ def _send_rate_mail(
         attachments=attachments,
     )
     print(f"✅ 邮件已发送到 {', '.join(recipients)}: {subject}")
+    return True
+
+
+def _cleanup_screenshots(result: dict | None) -> None:
+    """删除本地 BOCHK 页面截图文件。
+
+    截图只是邮件的临时附件，邮件发出后本地副本不再需要，
+    避免每次运行都在 temp 目录堆积 png。删除失败只记录警告。
+
+    Args:
+        result: process_rate_export 返回的结果字典
+    """
+    if not result:
+        return
+    for shot in result.get("screenshots") or []:
+        path: Path = shot["path"]
+        try:
+            path.unlink(missing_ok=True)
+            logger.info("[FX] 已删除本地截图: %s", path.name)
+        except Exception as exc:
+            logger.warning("[FX] 删除本地截图失败: %s (%s)", path, exc)
 
 
 def _send_error_report(
@@ -661,6 +699,7 @@ def main() -> None:
                 logger.error("[FX] 企业微信错误通知发送失败: %s", we)
 
     failed = False
+    mail_sent = False
 
     # 2. FX_RECIEVER: 原有方案 — 自定义汇率 + 交易所汇率（含 HKEx 校验）
     #    没有交易所汇率时（周末 / 香港公众假期，HKEx 不发布当日汇率，
@@ -691,7 +730,10 @@ def main() -> None:
             attachments = [
                 p for p in (result["custom_path"], result["exchange_path"]) if p
             ]
-            _send_rate_mail(
+            attachments += [
+                s["path"] for s in (result.get("screenshots") or [])
+            ]
+            mail_sent = _send_rate_mail(
                 fx_recipients, subject, html_body, attachments,
             )
 
@@ -709,12 +751,22 @@ def main() -> None:
                 f"汇率报告 — {result['date_val'].strftime('%Y-%m-%d')}"
                 f"（仅自定义汇率）"
             )
-            _send_rate_mail(
+            boc_attachments = (
+                [result["custom_path"]] if result["custom_path"] else []
+            )
+            boc_attachments += [
+                s["path"] for s in (result.get("screenshots") or [])
+            ]
+            mail_sent = _send_rate_mail(
                 boc_recipients,
                 subject,
                 html_body,
-                [result["custom_path"]] if result["custom_path"] else [],
+                boc_attachments,
             )
+
+    # 4. 邮件已发出后删除本地截图（截图只是临时附件，无需保留）
+    if mail_sent:
+        _cleanup_screenshots(result)
 
     if failed:
         logger.info("===== FX Mail 异常结束 =====")

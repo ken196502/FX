@@ -46,6 +46,7 @@ from web_rates import (
     fetch_bochk_usdrates,
     fetch_hkex_stampfx,
 )
+from web_shot import capture_rate_pages
 
 logger = logging.getLogger(__name__)
 
@@ -182,8 +183,9 @@ MARKDOWN_FACTORS: dict[str, tuple[float, float]] = {
     "USD/HKD": (0.998, 1.002),
     "USD/CNY": (0.98, 1.02),
 }
-# 默认因子（未配置的币对）
-DEFAULT_MARKDOWN_FACTOR: tuple[float, float] = (0.98, 1.02)
+# 默认因子（未配置的币对）：1.0 表示不加价差，
+# Buy/Sell 直接等于 BOCHK 原始牌价
+DEFAULT_MARKDOWN_FACTOR: tuple[float, float] = (1.0, 1.0)
 
 # HKEx 货币英文名 -> ISO 币种代码
 HKEX_CURRENCY_MAP: dict[str, str] = {
@@ -241,8 +243,8 @@ except Exception:  # pragma: no cover - 依赖缺失时仅按工作日判断
 def _is_hk_trading_day(date_str: str) -> bool:
     """判断日期是否为 HKEx 交易日（周一至周五 且非香港公众假期）。
 
-    HKEx 在周末及香港公众假期不发布印花税率；此时取不到、或取到的是
-    上一交易日（非当日）的汇率，都属于正常现象，不应当作错误。
+    HKEx 在周末及香港公众假期不发布印花税率，此时取不到当日数据属于
+    正常现象，不应当作错误。
     中银香港(BOCHK)在假期仍可能提供参考汇率，因此「非交易日」也用于放宽
     对 BOCHK 的当日校验。
 
@@ -373,9 +375,9 @@ def _collect_bochk_fx_rates(date_str: str, errors: list[str]) -> list[dict]:
 def _collect_hkex_rates(date_str: str, errors: list[str]) -> dict:
     """从 HKEx 网站获取印花税率汇率。
 
-    HKEx 仅在交易日（周一至五且非香港公众假期）发布印花税率。
-    非交易日即使抓到上一交易日的数据也直接丢弃，绝不展示以免误导；
-    同时也不记为错误。交易日则必须拿到当日数据，否则记错。
+    HKEx 仅在交易日（周一至五且非香港公众假期）发布印花税率，
+    且只取目标日期当天的数据，绝不回退到上一交易日。
+    取不到数据时：交易日记为错误，非交易日属正常现象不记错。
 
     Args:
         date_str: YYYYMMDD 格式日期
@@ -397,25 +399,10 @@ def _collect_hkex_rates(date_str: str, errors: list[str]) -> dict:
             )
         return {}
 
-    got_date = str(data.get("date", ""))
-
-    # 非交易日: HKEx 不会发布当日汇率, 抓到的一定是上一交易日的数据,
-    # 直接丢弃, 不展示以免误导用户。
-    if not _is_hk_trading_day(date_str):
-        logger.info(
-            "[RE] HKEx 在 %s 非交易日, 丢弃抓到的上一交易日(%s)数据, "
-            "不展示以免误导",
-            date_str, got_date,
-        )
-        return {}
-
-    # 以下为交易日: 必须拿到当日数据, 否则记错
+    # fetch_hkex_stampfx 只返回目标日期当天的数据，取不到就是空，
+    # 不存在「抓到别的日期」的情况，无需再校验日期是否一致。
     if not data.get("rates"):
         errors.append(f"HKEx: 印花税率数据为空 (日期 {date_str})")
-    elif got_date and got_date != date_str:
-        msg = f"HKEx: 汇率不是当日的 (取得 {got_date}, 期望 {date_str})"
-        errors.append(msg)
-        logger.warning("[RE] %s", msg)
     return data
 
 
@@ -785,6 +772,7 @@ def process_rate_export(
     output_dir: str | None = None,
     send_error_notify: bool = True,
     include_hkex: bool = True,
+    capture_screenshots: bool = True,
 ) -> dict:
     """从 BOCHK 获取汇率并按 TFISF Excel 公式计算自定义汇率，生成 xlsx 文件。
 
@@ -795,6 +783,8 @@ def process_rate_export(
         send_error_notify: 出错时是否发送企业微信通知，默认 True
         include_hkex: 是否抓取 HKEx 印花税率并生成交易所汇率.xlsx，
             默认 True（完整方案）；False 时只抓 BOCHK，只生成自定义汇率
+        capture_screenshots: 是否截图 BOCHK 牌价页面作为邮件附件，
+            默认 True；截图失败只记录警告，不影响主流程
 
     Returns:
         包含以下键的字典：
@@ -807,6 +797,7 @@ def process_rate_export(
           - bochk_hkd_raw: BOCHK 港币原始汇率字典
           - bochk_usd_raw: BOCHK 美元原始汇率字典
           - hkex_data: HKEx 原始数据字典
+          - screenshots: BOCHK 页面截图列表，每项含 label / url / path
           - errors: 错误信息列表
     """
     if date_str is None:
@@ -881,6 +872,16 @@ def process_rate_export(
             "[RE] 无交易所汇率数据(HKEx 无数据/非交易日), 不生成交易所汇率.xlsx"
         )
 
+    # BOCHK 页面截图（作为邮件附件，供人工核对当时页面数字）
+    # 截图失败只告警，不阻断邮件发送
+    screenshots: list[dict] = []
+    if capture_screenshots:
+        screenshots = capture_rate_pages(date_str, out_dir)
+        logger.info("[RE] BOCHK 页面截图: %d 张", len(screenshots))
+        print(f"[RE] BOCHK 页面截图: {len(screenshots)} 张")
+    else:
+        logger.info("[RE] 已禁用页面截图")
+
     if errors and send_error_notify:
         error_lines = [f"【汇率导出异常 {date_str}】"]
         for e in errors:
@@ -901,5 +902,6 @@ def process_rate_export(
         "bochk_usd_raw": bochk_usd_raw,
         "bochk_fx_raw": bochk_fx_raw,
         "hkex_data": hkex_data,
+        "screenshots": screenshots,
         "errors": errors,
     }
