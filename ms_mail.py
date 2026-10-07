@@ -10,8 +10,12 @@ ms_mail.py - 通过 Microsoft Graph API 发送邮件
   MS_CLIENT_ID     - 应用注册的 client ID
   MS_CLIENT_SECRET - 应用注册的 client secret
   SENDER           - 发件邮箱地址
-  FX_RECIEVER      - 收件邮箱地址（完整汇率报告）
-  BOC_RECIEVER     - 收件邮箱地址（仅自定义汇率，BOCHK 来源）
+  FX_RECIEVER      - 收件邮箱地址（完整汇率报告），也支持 FX_RECEIVER 拼写
+  BOC_RECIEVER     - 收件邮箱地址（仅自定义汇率，BOCHK 来源），
+                     也支持 BOC_RECEIVER 拼写
+
+收件人环境变量支持多个邮箱地址，用 , 或 ; 分隔，
+统一转换为 Graph API 的 toRecipients 列表（即一封邮件多个收件人）。
 """
 
 from __future__ import annotations
@@ -102,6 +106,10 @@ def send_mail(
     mbox = sender or MS_MAILBOX
     if not mbox:
         raise RuntimeError("未指定发件邮箱地址 (MS_MAILBOX/SENDER 未配置)")
+
+    recipients = [a.strip() for a in (recipients or []) if a and a.strip()]
+    if not recipients:
+        raise ValueError("收件人为空，无法发送邮件")
 
     to_recipients = [
         {"emailAddress": {"address": addr}}

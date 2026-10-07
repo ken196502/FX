@@ -7,8 +7,10 @@ main.py - FX 汇率邮件发送入口
     uv run fxmail --date 20260930  # 发送指定日期汇率邮件
 
 收件人（环境变量，至少配置其一，多个地址用 , 或 ; 分隔）：
-    FX_RECIEVER   - 完整方案：自定义汇率 + 交易所汇率（含 HKEx 校验）
-    BOC_RECIEVER  - 仅自定义汇率（只抓 BOCHK，不抓 HKEx，不校验交易所汇率）
+    FX_RECIEVER / FX_RECEIVER  - 完整方案：自定义汇率 + 交易所汇率（含 HKEx 校验）
+    BOC_RECIEVER / BOC_RECEIVER - 仅自定义汇率（只抓 BOCHK，不抓 HKEx，不校验交易所汇率）
+    两种拼写均支持；多个邮箱可用逗号、分号或空格分隔，如
+    FX_RECEIVER="a@xx.com;b@xx.com"。
     两者都配置时，一次运行会给两边各发一封：FX_RECIEVER 收完整报告，
     BOC_RECIEVER 只收自定义汇率部分。
 
@@ -24,6 +26,13 @@ main.py - FX 汇率邮件发送入口
     出现任何异常（网页打不开 / 汇率获取不到 / 汇率不是当日）时，
     不发送汇率邮件（也不带汇率附件），只发送企业微信错误通知 +
     一封【错误报告】邮件，并以退出码 1 结束。
+
+发送机制：
+    每次抓取后都会检查是否取到交易所汇率（HKEx 印花税率）。
+    没有交易所汇率时（如周末 / 香港公众假期，HKEx 不发布当日汇率），
+    本次不给 FX_RECIEVER 发送任何邮件（包括汇率报告和错误报告），
+    避免发出无交易所汇率的邮件造成误导；BOC_RECIEVER 的自定义汇率
+    邮件不受影响，仍照常发送。
 """
 
 from __future__ import annotations
@@ -67,20 +76,43 @@ def _env(key: str) -> str:
 
 
 def _recipients(*keys: str) -> list[str]:
-    """读取收件人环境变量，支持多个地址用 , 或 ; 分隔。
+    """读取收件人环境变量，支持多个地址用 , / ; / 空白分隔。
+
+    依次尝试给定的环境变量名（兼容 RECIEVER / RECEIVER 两种拼写），
+    所有非空变量中的邮箱都会合并；多个邮箱地址可用逗号、分号或空格分隔。
+    解析结果去重并保持原有顺序，格式明显非法的地址会被忽略并记录警告。
 
     Args:
-        *keys: 依次尝试的环境变量名，第一个非空者生效
+        *keys: 依次读取的环境变量名，全部非空变量的结果会合并
 
     Returns:
         收件邮箱地址列表，未配置时为空列表
     """
-    raw = ""
+    result: list[str] = []
+    seen: set[str] = set()
     for key in keys:
         raw = _env(key)
-        if raw:
-            break
-    return [addr.strip() for addr in re.split(r"[,;]", raw) if addr.strip()]
+        if not raw:
+            continue
+        parsed: list[str] = []
+        for addr in re.split(r"[,;\s]+", raw):
+            addr = addr.strip().strip('"').strip("'")
+            if not addr:
+                continue
+            if "@" not in addr or "." not in addr.rsplit("@", 1)[-1]:
+                logger.warning("[FX] 忽略无效的收件人地址 (%s): %s", key, addr)
+                continue
+            key_l = addr.lower()
+            if key_l in seen:
+                continue
+            seen.add(key_l)
+            parsed.append(addr)
+        logger.info(
+            "[FX] %s 解析到 %d 个收件人: %s", key, len(parsed), ", ".join(parsed),
+        )
+        result.extend(parsed)
+
+    return result
 
 
 # -----------------------------------------------------------------------
@@ -540,11 +572,16 @@ def main() -> None:
         print(f"错误: 日期格式不正确 {date_str} (应为 YYYYMMDD)", file=sys.stderr)
         sys.exit(1)
 
-    fx_recipients = _recipients("FX_RECIEVER")
+    # 两种拼写都支持：FX_RECIEVER（历史拼写）/ FX_RECEIVER
+    fx_recipients = _recipients("FX_RECIEVER", "FX_RECEIVER")
     # BOC_RECIEVER 只接收自定义汇率（BOCHK），不依赖 HKEx 数据
     boc_recipients = _recipients("BOC_RECIEVER", "BOC_RECEIVER")
     if not fx_recipients and not boc_recipients:
-        print("错误: FX_RECIEVER / BOC_RECIEVER 均未配置", file=sys.stderr)
+        print(
+            "错误: FX_RECIEVER / FX_RECEIVER / BOC_RECIEVER / BOC_RECEIVER "
+            "均未配置有效收件人",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # FX_RECIEVER 走完整方案（含 HKEx），只有它时才抓交易所汇率
@@ -582,11 +619,28 @@ def main() -> None:
     failed = False
 
     # 2. FX_RECIEVER: 原有方案 — 自定义汇率 + 交易所汇率（含 HKEx 校验）
+    #    没有交易所汇率时（周末 / 香港公众假期，HKEx 不发布当日汇率，
+    #    或 HKEx 数据为空），本次不给 FX_RECIEVER 发任何邮件，
+    #    避免发出缺少交易所汇率的报告造成误导。
     if fx_recipients:
+        has_exchange = bool(result and result.get("exchange_rows"))
         if errors:
-            # 有错误则只发错误报告邮件（不发汇率邮件，也不带任何汇率附件）
-            _send_error_report(fx_recipients, errors, date_str, tb_text)
+            # 有错误则记录失败并不发邮件；企业微信告警已在上面发出
             failed = True
+            logger.error(
+                "[FX] 本次存在 %d 条错误，未发送邮件给 FX_RECIEVER: %s",
+                len(errors), ", ".join(fx_recipients),
+            )
+            print(f"⚠ 本次数据存在 {len(errors)} 条异常，"
+                  f"未发送邮件给 {', '.join(fx_recipients)}")
+        elif not has_exchange:
+            # 无交易所汇率（周末/香港公众假期，HKEx 不发布当日汇率）
+            logger.info(
+                "[FX] 本次无交易所汇率(date=%s)，不发邮件给 FX_RECIEVER: %s",
+                date_str, ", ".join(fx_recipients),
+            )
+            print("ℹ 本次无交易所汇率（HKEx 未发布当日汇率），"
+                  f"未发送邮件给 {', '.join(fx_recipients)}")
         else:
             html_body = _build_email_html(result)
             subject = f"汇率报告 — {result['date_val'].strftime('%Y-%m-%d')}"
