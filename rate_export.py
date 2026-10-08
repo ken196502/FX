@@ -32,11 +32,11 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-import logging
 import os
 import re
 from pathlib import Path
 
+from log_setup import get_logger
 from openpyxl import Workbook
 from openpyxl.utils import get_column_letter
 
@@ -49,7 +49,7 @@ from web_rates import (
 )
 from web_shot import resolve_rate_page_shots
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 def _env(key: str) -> str:
@@ -218,13 +218,16 @@ def _fetch_safe(label: str, errors: list[str], func, *args) -> dict:
     Returns:
         抓取结果的字典，失败时为空字典
     """
+    logger.info("[RE] 开始抓取 %s", label)
     try:
-        return func(*args) or {}
+        data = func(*args) or {}
     except Exception as exc:
         msg = f"{label}: 页面无法打开或抓取失败 ({type(exc).__name__}: {exc})"
         errors.append(msg)
         logger.error("[RE] %s", msg)
         return {}
+    logger.info("[RE] %s 抓取完成", label)
+    return data
 
 
 # 香港公众假期（用于判断 HKEx 是否开市）。加载失败则回退到仅按工作日判断，
@@ -927,7 +930,16 @@ def process_rate_export(
     out_dir = Path(output_dir) if output_dir else Path.cwd() / "temp"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info("[RE] 开始汇率整合导出, date=%s", date_str)
+    started_at = dt.datetime.now()
+    logger.info(
+        "[RE] 开始汇率整合导出, date=%s, 输出目录=%s, include_hkex=%s, "
+        "reuse_daily=%s, capture_screenshots=%s",
+        date_str, out_dir, include_hkex, reuse_daily, capture_screenshots,
+    )
+    logger.debug(
+        "[RE] RATE_PAIRS 白名单: %s",
+        ", ".join(RATE_PAIRS) or "(未配置, 不限制)",
+    )
 
     errors: list[str] = []
 
@@ -947,12 +959,9 @@ def process_rate_export(
         bochk_fx_raw = snapshot.get("bochk_fx_raw") or {}
         bochk_update_times = snapshot.get("bochk_update_times") or {}
         logger.info(
-            "[RE] 复用当日已有自定义汇率(date=%s, 快照 %s)，跳过 BOCHK 抓取",
-            date_str, snapshot.get("created_at", ""),
-        )
-        print(
-            f"[RE] 复用当日自定义汇率快照: {snapshot_path.name} "
-            f"(生成于 {snapshot.get('created_at', '未知时间')})，不重新抓取 BOCHK"
+            "[RE] 复用当日已有自定义汇率(date=%s, 快照 %s，生成于 %s)，"
+            "跳过 BOCHK 抓取",
+            date_str, snapshot_path.name, snapshot.get("created_at", "未知时间"),
         )
     else:
         bochk_rates, upd_hkd = _collect_bochk_rates(date_str, errors)
@@ -1001,11 +1010,9 @@ def process_rate_export(
     if snapshot:
         # 复用快照时保留当日已生成的文件；文件缺失时才按快照数据重建
         logger.info("[RE] 复用自定义汇率文件: %s (%d 行)", custom_path, len(custom_rows))
-        print(f"[RE] 复用自定义汇率文件: {custom_path} ({len(custom_rows)} 行)")
     if not snapshot or not custom_path.exists():
         _write_xlsx(custom_rows, custom_path, date_val)
         logger.info("[RE] 生成自定义汇率: %s (%d 行)", custom_path, len(custom_rows))
-        print(f"[RE] 生成自定义汇率: {custom_path} ({len(custom_rows)} 行)")
 
     if not snapshot:
         _save_snapshot(
@@ -1023,7 +1030,6 @@ def process_rate_export(
         logger.info(
             "[RE] 生成交易所汇率: %s (%d 行)", exchange_path, len(exchange_rows)
         )
-        print(f"[RE] 生成交易所汇率: {exchange_path} ({len(exchange_rows)} 行)")
     else:
         logger.info(
             "[RE] 无交易所汇率数据(HKEx 无数据/非交易日), 不生成交易所汇率.xlsx"
@@ -1036,8 +1042,11 @@ def process_rate_export(
         screenshots = resolve_rate_page_shots(
             date_str, out_dir, allow_reuse=reuse_daily,
         )
-        logger.info("[RE] BOCHK 页面截图: %d 张", len(screenshots))
-        print(f"[RE] BOCHK 页面截图: {len(screenshots)} 张")
+        logger.info(
+            "[RE] BOCHK 页面截图: %d 张 (%s)",
+            len(screenshots),
+            ", ".join(s["path"].name for s in screenshots) or "(无)",
+        )
     else:
         logger.info("[RE] 已禁用页面截图")
 
@@ -1049,6 +1058,18 @@ def process_rate_export(
             send_error("\n".join(error_lines))
         except Exception as exc:
             logger.error("[RE] 企业微信错误通知发送失败: %s", exc)
+
+    elapsed = (dt.datetime.now() - started_at).total_seconds()
+    if errors:
+        logger.error("[RE] 汇率整合导出完成(有异常): 错误 %d 条", len(errors))
+        for idx, e in enumerate(errors, start=1):
+            logger.error("[RE] 错误 %d/%d: %s", idx, len(errors), e)
+    else:
+        logger.info("[RE] 汇率整合导出完成，本次无数据异常")
+    logger.info(
+        "[RE] 汇总: 自定义 %d 行, 交易所 %d 行, 截图 %d 张, 耗时 %.1fs",
+        len(custom_rows), len(exchange_rows), len(screenshots), elapsed,
+    )
 
     return {
         "date_str": date_str,

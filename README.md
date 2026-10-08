@@ -1,0 +1,37 @@
+# FX 汇率邮件
+
+从中銀香港（BOCHK）与 HKEx 抓取汇率，按 TFISF Excel 公式计算自定义汇率，
+生成 xlsx 附件并通过 Microsoft Graph 发送汇率报告邮件。
+
+## 用法
+
+```bash
+uv run fxmail                       # 发送今日汇率邮件
+uv run fxmail --date 20260930       # 发送指定日期汇率邮件
+uv run fxmail --no-reuse            # 忽略当日缓存，强制重新抓取 BOCHK
+uv run fxmail --log-level DEBUG     # 排障：输出调试级别日志
+```
+
+## 日志
+
+所有模块统一通过 `log_setup.py` 输出日志：
+
+- 控制台（stdout）+ 文件 `logs/fx_YYYYMMDD.log`，UTF-8，单文件 5MB 轮转、保留 10 份
+- 第三方库（requests / urllib3 / playwright 等）默认只输出 WARNING 以上
+
+可用环境变量或命令行参数调整：
+
+| 配置 | 环境变量 | 命令行参数 | 默认值 |
+| --- | --- | --- | --- |
+| 日志级别 | `LOG_LEVEL` | `--log-level` | `INFO` |
+| 日志目录 | `LOG_DIR` | `--log-dir` | `./logs` |
+| 文件名前缀 | `LOG_FILE_PREFIX` | - | `fx` |
+
+在代码里使用：
+
+```python
+from log_setup import get_logger
+
+logger = get_logger(__name__)
+logger.info("...")
+```

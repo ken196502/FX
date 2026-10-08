@@ -5,6 +5,12 @@ main.py - FX 汇率邮件发送入口
 用法：
     uv run fxmail              # 发送今日汇率邮件
     uv run fxmail --date 20260930  # 发送指定日期汇率邮件
+    uv run fxmail --log-level DEBUG --log-dir ./logs  # 排障：输出调试日志
+
+日志：
+    运行日志同时写入控制台和文件（默认 ./logs/fx_YYYYMMDD.log，
+    单文件 5MB 后轮转，保留 10 份）。可用 --log-level / --log-dir，
+    或环境变量 LOG_LEVEL / LOG_DIR / LOG_FILE_PREFIX 调整。
 
 收件人（环境变量，至少配置其一，多个地址用 , 或 ; 分隔）：
     FX_RECIEVER / FX_RECEIVER  - 完整方案：自定义汇率 + 交易所汇率（含 HKEx 校验）
@@ -48,7 +54,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
-import logging
 import os
 import re
 import sys
@@ -59,6 +64,7 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
+from log_setup import get_logger, log_file_path, setup_logging
 from ms_mail import send_mail
 from sc_infra import send_error
 from rate_export import (
@@ -74,12 +80,7 @@ from web_rates import (
 )
 from web_shot import cleanup_previous_shots
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # 自定义汇率 / 截图 / 当日快照的输出目录
 # 与 rate_export.process_rate_export 的默认输出目录保持一致
@@ -581,14 +582,21 @@ def _send_rate_mail(
     Returns:
         True 表示发送成功；发送失败时抛出异常
     """
-    logger.info("[FX] 发送邮件到 %s: %s", ", ".join(recipients), subject)
+    logger.info(
+        "[FX] 发送邮件到 %s: %s (附件 %d 个)",
+        ", ".join(recipients), subject, len(attachments or []),
+    )
+    logger.debug(
+        "[FX] 附件清单: %s",
+        ", ".join(str(p.name) for p in (attachments or [])) or "(无)",
+    )
     send_mail(
         subject=subject,
         body_html=body_html,
         recipients=recipients,
         attachments=attachments,
     )
-    print(f"✅ 邮件已发送到 {', '.join(recipients)}: {subject}")
+    logger.info("✅ 邮件已发送到 %s: %s", ", ".join(recipients), subject)
     return True
 
 
@@ -631,16 +639,20 @@ def _send_error_report(
     subject = f"【错误报告】汇率报告 — {_date_display(date_str)} 数据异常"
     html_body = _build_error_email_html(errors, date_str, traceback_text)
 
-    logger.error("发送错误报告邮件到 %s: %s", ", ".join(recipients), subject)
+    logger.error(
+        "发送错误报告邮件到 %s: %s (错误 %d 条)",
+        ", ".join(recipients), subject, len(errors),
+    )
+    for e in errors:
+        logger.error("[FX] 错误明细: %s", e)
     send_mail(
         subject=subject,
         body_html=html_body,
         recipients=recipients,
         attachments=None,
     )
-    print(
-        f"⚠ 错误报告邮件已发送到 {', '.join(recipients)}: {subject}",
-        file=sys.stderr,
+    logger.warning(
+        "⚠ 错误报告邮件已发送到 %s: %s", ", ".join(recipients), subject,
     )
 
 
@@ -665,7 +677,25 @@ def main() -> None:
         action="store_true",
         help="不使用当日已生成的自定义汇率/截图缓存，强制重新抓取 BOCHK",
     )
+    parser.add_argument(
+        "--log-level",
+        help="日志级别 DEBUG/INFO/WARNING/ERROR，默认 INFO（也可用 LOG_LEVEL）",
+    )
+    parser.add_argument(
+        "--log-dir",
+        help="日志目录，默认 ./logs（也可用 LOG_DIR）",
+    )
     args = parser.parse_args()
+
+    # 按命令行参数重新初始化日志（模块导入时已用默认配置过一次）
+    setup_logging(level=args.log_level, log_dir=args.log_dir, force=True)
+    started_at = dt.datetime.now()
+    logger.info(
+        "[FX] 命令行参数: date=%s, no_wechat=%s, no_reuse=%s, log_level=%s",
+        args.date or "(今天)", args.no_wechat, args.no_reuse,
+        args.log_level or "(默认 INFO)",
+    )
+    logger.info("[FX] 日志文件: %s", log_file_path() or "(仅控制台)")
 
     date_str = args.date
     if date_str is None:
@@ -673,6 +703,7 @@ def main() -> None:
     try:
         _date_display(date_str)
     except ValueError:
+        logger.error("日期格式不正确 %s (应为 YYYYMMDD)", date_str)
         print(f"错误: 日期格式不正确 {date_str} (应为 YYYYMMDD)", file=sys.stderr)
         sys.exit(1)
 
@@ -681,6 +712,10 @@ def main() -> None:
     # BOC_RECIEVER 只接收自定义汇率（BOCHK），不依赖 HKEx 数据
     boc_recipients = _recipients("BOC_RECIEVER", "BOC_RECEIVER")
     if not fx_recipients and not boc_recipients:
+        logger.error(
+            "FX_RECIEVER / FX_RECEIVER / BOC_RECIEVER / BOC_RECEIVER "
+            "均未配置有效收件人，终止运行"
+        )
         print(
             "错误: FX_RECIEVER / FX_RECEIVER / BOC_RECIEVER / BOC_RECEIVER "
             "均未配置有效收件人",
@@ -698,6 +733,48 @@ def main() -> None:
         "否(强制重抓)" if args.no_reuse else "是",
     )
 
+    try:
+        failed = _run(args, date_str, fx_recipients, boc_recipients, include_hkex)
+    except Exception:
+        logger.exception("[FX] 运行过程出现未捕获异常")
+        if not args.no_wechat:
+            try:
+                send_error(f"【汇率导出异常 {date_str}】运行过程出现未捕获异常")
+            except Exception as we:
+                logger.error("[FX] 企业微信错误通知发送失败: %s", we)
+        failed = True
+
+    elapsed = (dt.datetime.now() - started_at).total_seconds()
+    logger.info(
+        "[FX] 本次运行耗时 %.1fs, 日志文件: %s",
+        elapsed, log_file_path() or "(仅控制台)",
+    )
+    if failed:
+        logger.error("===== FX Mail 异常结束 =====")
+        sys.exit(1)
+
+    logger.info("===== FX Mail 完成 =====")
+
+
+def _run(
+    args: argparse.Namespace,
+    date_str: str,
+    fx_recipients: list[str],
+    boc_recipients: list[str],
+    include_hkex: bool,
+) -> bool:
+    """执行「抓汇率 → 生成 Excel → 发邮件」主流程。
+
+    Args:
+        args: 命令行参数命名空间
+        date_str: 目标日期 YYYYMMDD
+        fx_recipients: 完整汇率报告收件人（自定义 + 交易所）
+        boc_recipients: 仅自定义汇率收件人
+        include_hkex: 是否抓取 HKEx 印花税率
+
+    Returns:
+        True 表示本次运行存在失败（调用方据此返回退出码 1）
+    """
     # 0. 先清理历史日期的截图（当日截图需保留供同日复用）
     _cleanup_old_screenshots(date_str)
 
@@ -742,17 +819,18 @@ def main() -> None:
                 "[FX] 本次存在 %d 条错误，未发送邮件给 FX_RECIEVER: %s",
                 len(errors), ", ".join(fx_recipients),
             )
-            print(f"⚠ 本次数据存在 {len(errors)} 条异常，"
-                  f"未发送邮件给 {', '.join(fx_recipients)}")
         elif not has_exchange:
             # 无交易所汇率（周末/香港公众假期，HKEx 不发布当日汇率）
             logger.info(
                 "[FX] 本次无交易所汇率(date=%s)，不发邮件给 FX_RECIEVER: %s",
                 date_str, ", ".join(fx_recipients),
             )
-            print("ℹ 本次无交易所汇率（HKEx 未发布当日汇率），"
-                  f"未发送邮件给 {', '.join(fx_recipients)}")
         else:
+            logger.info(
+                "[FX] 汇率数据就绪: 自定义 %d 行, 交易所 %d 行, 截图 %d 张",
+                len(result["custom_rows"]), len(result["exchange_rows"]),
+                len(result.get("screenshots") or []),
+            )
             html_body = _build_email_html(result)
             subject = f"汇率报告 — {result['date_val'].strftime('%Y-%m-%d')}"
             attachments = [
@@ -769,6 +847,13 @@ def main() -> None:
         if boc_errors:
             _send_error_report(boc_recipients, boc_errors, date_str, tb_text)
             failed = True
+        elif result is None:
+            # 汇率结果为空（如流程异常且错误都被归到 HKEx），不能发空邮件
+            failed = True
+            logger.error(
+                "[FX] 汇率结果为空，未发送邮件给 BOC_RECIEVER: %s",
+                ", ".join(boc_recipients),
+            )
         else:
             html_body = _build_email_html(
                 result, include_exchange=False, errors=[],
@@ -785,11 +870,12 @@ def main() -> None:
             ]
             _send_rate_mail(boc_recipients, subject, html_body, boc_attachments)
 
-    if failed:
-        logger.info("===== FX Mail 异常结束 =====")
-        sys.exit(1)
+    if errors:
+        logger.warning("[FX] 本次共收集到 %d 条错误", len(errors))
+        for idx, e in enumerate(errors, start=1):
+            logger.warning("[FX] 错误汇总 %d/%d: %s", idx, len(errors), e)
 
-    logger.info("===== FX Mail 完成 =====")
+    return failed
 
 
 if __name__ == "__main__":

@@ -19,10 +19,11 @@ URL 完全一致），页面上含「資料更新於香港時間」，可直接�
 from __future__ import annotations
 
 import datetime as dt
-import logging
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from log_setup import get_logger
+
+logger = get_logger(__name__)
 
 # 截图目标：(中文标签, URL, 文件名前缀)
 SHOT_TARGETS: tuple[tuple[str, str, str], ...] = (
@@ -171,6 +172,12 @@ def capture_rate_pages(
         logger.warning("[SHOT] 未安装 playwright，跳过页面截图")
         return []
 
+    started_at = dt.datetime.now()
+    logger.info(
+        "[SHOT] 开始截图 %d 个页面: %s",
+        len(targets), ", ".join(t[2] for t in targets),
+    )
+
     results: list[dict] = []
     try:
         with sync_playwright() as pw:
@@ -180,6 +187,7 @@ def capture_rate_pages(
             try:
                 for label, url, prefix in targets:
                     path = _shot_path(out_dir, prefix, date_str)
+                    page_started_at = dt.datetime.now()
                     try:
                         page = browser.new_page(viewport=_VIEWPORT)
                         try:
@@ -207,7 +215,9 @@ def capture_rate_pages(
 
                     size_kb = path.stat().st_size / 1024
                     logger.info(
-                        "[SHOT] %s -> %s (%.0f KB)", label, path.name, size_kb,
+                        "[SHOT] %s -> %s (%.0f KB, 耗时 %.1fs)",
+                        label, path.name, size_kb,
+                        (dt.datetime.now() - page_started_at).total_seconds(),
                     )
                     results.append({
                         "label": label,
@@ -220,6 +230,17 @@ def capture_rate_pages(
     except Exception as exc:
         logger.warning("[SHOT] 截图流程异常，已跳过: %s", exc)
         return results
+
+    logger.info(
+        "[SHOT] 截图完成: 成功 %d/%d 张, 耗时 %.1fs",
+        len(results), len(targets),
+        (dt.datetime.now() - started_at).total_seconds(),
+    )
+    if len(results) < len(targets):
+        logger.warning(
+            "[SHOT] 有 %d 个页面未截到图，邮件附件中可能缺少对应截图",
+            len(targets) - len(results),
+        )
 
     return results
 
@@ -249,9 +270,14 @@ def resolve_rate_page_shots(
         t for t in SHOT_TARGETS
         if _shot_path(out_dir, t[2], date_str).name not in have
     )
+    logger.info(
+        "[SHOT] 截图需求: 复用 %d 张, 待补 %d 张 (allow_reuse=%s)",
+        len(shots), len(missing), allow_reuse,
+    )
     if missing:
         logger.info(
-            "[SHOT] 当日仍有 %d 个页面无截图，开始补截图", len(missing),
+            "[SHOT] 当日仍有 %d 个页面无截图，开始补截图: %s",
+            len(missing), ", ".join(t[2] for t in missing),
         )
         shots.extend(capture_rate_pages(date_str, out_dir, targets=missing))
 
@@ -259,7 +285,9 @@ def resolve_rate_page_shots(
         _shot_path(out_dir, prefix, date_str).name: idx
         for idx, (_, _, prefix) in enumerate(SHOT_TARGETS)
     }
-    return sorted(shots, key=lambda s: order.get(s["path"].name, len(order)))
+    final = sorted(shots, key=lambda s: order.get(s["path"].name, len(order)))
+    logger.info("[SHOT] 当日可用截图共 %d 张", len(final))
+    return final
 
 
 def cleanup_previous_shots(
@@ -283,6 +311,9 @@ def cleanup_previous_shots(
         return 0
     prefixes = {prefix for _, _, prefix in SHOT_TARGETS}
     removed = 0
+    logger.debug(
+        "[SHOT] 开始清理 %s 中早于 %s 的历史截图", out_dir, keep_date_str,
+    )
     for path in out_dir.glob("*.png"):
         name = path.stem
         if "_" not in name:
@@ -298,6 +329,8 @@ def cleanup_previous_shots(
             logger.info("[SHOT] 已清理历史日期截图: %s", path.name)
         except Exception as exc:
             logger.warning("[SHOT] 清理截图失败: %s (%s)", path, exc)
+    if removed:
+        logger.info("[SHOT] 历史截图清理完成, 共删除 %d 个文件", removed)
     return removed
 
 

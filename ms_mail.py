@@ -21,12 +21,12 @@ ms_mail.py - 通过 Microsoft Graph API 发送邮件
 from __future__ import annotations
 
 import base64
-import logging
 from pathlib import Path
 
+from log_setup import get_logger
 from ms_graph import get_access_token, MS_MAILBOX
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
@@ -53,6 +53,13 @@ def _build_attachment(path: Path) -> dict:
     Returns:
         附件字典，含 @odata.type / name / contentType / contentBytes
     """
+    if not path.exists():
+        logger.error("[MS Mail] 附件文件不存在: %s", path)
+    else:
+        logger.debug(
+            "[MS Mail] 读取附件: %s (%.0f KB)",
+            path.name, path.stat().st_size / 1024,
+        )
     return {
         "@odata.type": "#microsoft.graph.fileAttachment",
         "name": path.name,
@@ -143,10 +150,30 @@ def send_mail(
         "[MS Mail] 发送邮件: from=%s, to=%s, subject=%s, attachments=%d",
         mbox, recipients, subject, len(attachments or []),
     )
+    logger.debug("[MS Mail] 请求地址: %s", url)
+    for path in attachments or []:
+        path = Path(path)
+        if not path.exists():
+            logger.warning("[MS Mail] 附件不存在，将被跳过: %s", path)
+        else:
+            logger.debug(
+                "[MS Mail] 附件: %s (%.0f KB)",
+                path.name, path.stat().st_size / 1024,
+            )
 
     import requests
-    resp = requests.post(url, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=60)
+    except Exception as exc:
+        logger.error(
+            "[MS Mail] 邮件发送请求异常 (%s: %s)", type(exc).__name__, exc
+        )
+        raise
+    if not resp.ok:
+        logger.error(
+            "[MS Mail] 邮件发送失败: %s %s", resp.status_code, resp.text[:500]
+        )
+        resp.raise_for_status()
 
-    logger.info("[MS Mail] 邮件发送成功")
+    logger.info("[MS Mail] 邮件发送成功 (HTTP %s)", resp.status_code)
     return {"status": "ok", "status_code": resp.status_code}

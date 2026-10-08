@@ -10,3 +10,7 @@ wheels/
 .venv
 temp/
 .env
+
+# Logs
+logs/
+*.log

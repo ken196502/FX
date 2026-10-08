@@ -15,7 +15,6 @@ ms_graph.py - Microsoft Graph API 认证与邮件读取
 from __future__ import annotations
 
 import datetime as dt
-import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,9 +22,11 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from log_setup import get_logger
+
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +63,7 @@ def get_access_token() -> str:
     cached = _token_cache["token"]
     expires = _token_cache["expires"]
     if cached and dt.datetime.now().timestamp() < expires:
+        logger.debug("[MS Graph] 复用缓存中的 access token")
         return cached
 
     if not MS_TENANT_ID or not MS_CLIENT_ID or not MS_CLIENT_SECRET:
@@ -77,7 +79,14 @@ def get_access_token() -> str:
         "scope": "https://graph.microsoft.com/.default",
         "grant_type": "client_credentials",
     }
-    resp = requests.post(url, data=data, timeout=30)
+    logger.debug("[MS Graph] 请求 access token: %s", url)
+    try:
+        resp = requests.post(url, data=data, timeout=30)
+    except Exception as exc:
+        logger.error(
+            "[MS Graph] token 请求异常 (%s: %s)", type(exc).__name__, exc
+        )
+        raise
     if not resp.ok:
         logger.error("[MS Graph] token 请求失败: %s %s",
                       resp.status_code, resp.text)
@@ -177,11 +186,22 @@ def fetch_mails(
         params["$filter"] = " and ".join(filters)
 
     logger.info(
-        "[MS Graph] 查询邮箱=%s, 发件人=%s, 日期=%s",
-        mbox, sender or "(全部)", date_str or "(全部)",
+        "[MS Graph] 查询邮箱=%s, 发件人=%s, 日期=%s, top=%d",
+        mbox, sender or "(全部)", date_str or "(全部)", top,
     )
-    resp = requests.get(url, headers=headers, params=params, timeout=30)
-    resp.raise_for_status()
+    logger.debug("[MS Graph] 查询参数: %s", params)
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+    except Exception as exc:
+        logger.error(
+            "[MS Graph] 邮件查询请求异常 (%s: %s)", type(exc).__name__, exc
+        )
+        raise
+    if not resp.ok:
+        logger.error(
+            "[MS Graph] 邮件查询失败: %s %s", resp.status_code, resp.text[:500]
+        )
+        resp.raise_for_status()
     body = resp.json()
 
     items: list[MailItem] = []
@@ -199,6 +219,11 @@ def fetch_mails(
         ))
 
     logger.info("[MS Graph] 查询到 %d 封邮件", len(items))
+    for item in items:
+        logger.debug(
+            "[MS Graph] 邮件: 主题=%s, 发件人=%s, 时间=%s, 附件=%s",
+            item.subject, item.sender, item.sent_datetime, item.has_attachments,
+        )
     return items
 
 
@@ -218,8 +243,14 @@ def fetch_mail_body(message_id: str, mailbox: str | None = None) -> str:
     url = f"{_GRAPH_BASE}/users/{mbox}/messages/{message_id}"
     params = {"$select": "subject,body"}
 
+    logger.debug("[MS Graph] 读取邮件正文: message_id=%s", message_id)
     resp = requests.get(url, headers=headers, params=params, timeout=30)
-    resp.raise_for_status()
+    if not resp.ok:
+        logger.error(
+            "[MS Graph] 读取邮件正文失败: %s %s",
+            resp.status_code, resp.text[:500],
+        )
+        resp.raise_for_status()
     body = resp.json()
     content = body.get("body", {})
     content_type = content.get("contentType", "")
@@ -228,6 +259,10 @@ def fetch_mail_body(message_id: str, mailbox: str | None = None) -> str:
     if content_type.lower() == "html":
         content_str = _strip_html(content_str)
 
+    logger.debug(
+        "[MS Graph] 邮件正文读取完成: 主题=%s, 正文 %d 字符",
+        body.get("subject", ""), len(content_str.strip()),
+    )
     return content_str.strip()
 
 
@@ -252,10 +287,22 @@ def fetch_mail_attachments(
     headers = {"Authorization": f"Bearer {token}"}
     url = f"{_GRAPH_BASE}/users/{mbox}/messages/{message_id}/attachments"
 
+    logger.debug("[MS Graph] 读取附件列表: message_id=%s", message_id)
     resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
+    if not resp.ok:
+        logger.error(
+            "[MS Graph] 读取附件列表失败: %s %s",
+            resp.status_code, resp.text[:500],
+        )
+        resp.raise_for_status()
     body = resp.json()
-    return body.get("value", [])
+    attachments = body.get("value", [])
+    logger.info(
+        "[MS Graph] 邮件 %s 含 %d 个附件: %s",
+        message_id, len(attachments),
+        ", ".join(a.get("name", "?") for a in attachments) or "(无)",
+    )
+    return attachments
 
 
 def fetch_attachment_content(
@@ -284,8 +331,17 @@ def fetch_attachment_content(
         f"/attachments/{attachment_id}/$value"
     )
 
+    logger.debug(
+        "[MS Graph] 下载附件内容: message_id=%s, attachment_id=%s",
+        message_id, attachment_id,
+    )
     resp = requests.get(url, headers=headers, timeout=60)
-    resp.raise_for_status()
+    if not resp.ok:
+        logger.error(
+            "[MS Graph] 下载附件失败: %s %s", resp.status_code, resp.text[:500]
+        )
+        resp.raise_for_status()
+    logger.debug("[MS Graph] 附件下载完成: %d 字节", len(resp.content or b""))
     return resp.content
 
 

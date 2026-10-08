@@ -20,7 +20,6 @@ web_rates.py - 从网站抓取银行汇率和交易所印花税率
 from __future__ import annotations
 
 import datetime as dt
-import logging
 import re
 from io import BytesIO
 from pathlib import Path
@@ -28,7 +27,9 @@ from pathlib import Path
 import requests
 import xlrd
 
-logger = logging.getLogger(__name__)
+from log_setup import get_logger
+
+logger = get_logger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +69,39 @@ BOCHK_USDRATES_PAGE = "https://www.bochk.com/tc/investment/rates/usdrates.html"
 BOCHK_FXRATES_PAGE = "https://www.bochk.com/tc/investment/rates/fxrates.html"
 
 
+def _http_get(url: str, headers: dict | None = None, timeout: int = _TIMEOUT):
+    """发送 GET 请求并统一记录日志。
+
+    请求异常、非 2xx 响应都会先记日志（含响应片段）再抛出，
+    便于事后从日志里判断是网络问题还是页面结构变化。
+
+    Args:
+        url: 请求地址
+        headers: 请求头，None 时用默认 _HEADERS
+        timeout: 超时秒数
+
+    Returns:
+        requests.Response 对象
+    """
+    logger.debug("[HTTP] GET %s", url)
+    try:
+        resp = requests.get(url, headers=headers or _HEADERS, timeout=timeout)
+    except Exception as exc:
+        logger.error("[HTTP] 请求失败 %s (%s: %s)", url, type(exc).__name__, exc)
+        raise
+    logger.debug(
+        "[HTTP] %s -> HTTP %s, %d 字节",
+        url, resp.status_code, len(resp.content or b""),
+    )
+    if not resp.ok:
+        logger.error(
+            "[HTTP] 非 2xx 响应 %s -> %s, 响应片段: %s",
+            url, resp.status_code, (resp.text or "")[:300],
+        )
+        resp.raise_for_status()
+    return resp
+
+
 # ---------------------------------------------------------------------------
 # HKEx 港交所印花税率
 # ---------------------------------------------------------------------------
@@ -104,12 +138,10 @@ def fetch_hkex_stampfx(date_str: str | None = None) -> dict:
 
     logger.info("[HKEX] 抓取印花税率页面, 目标日期=%s", date_str)
 
-    resp = requests.get(
-        HKEX_STAMPFX_URL, headers=_HEADERS, timeout=_TIMEOUT
-    )
+    resp = _http_get(HKEX_STAMPFX_URL)
     resp.encoding = "big5"
-    resp.raise_for_status()
     html = resp.text
+    logger.debug("[HKEX] 日历页面已获取, %d 字符", len(html))
 
     # 提取所有 (url, yyyymmdd, day) 匹配
     links: list[tuple[str, str]] = []
@@ -119,8 +151,12 @@ def fetch_hkex_stampfx(date_str: str | None = None) -> dict:
         links.append((url, yyyymmdd))
 
     if not links:
-        logger.warning("[HKEX] 页面中未找到任何 xls 链接")
+        logger.warning("[HKEX] 页面中未找到任何 xls 链接（页面结构可能已变化）")
         return {}
+    logger.info(
+        "[HKEX] 日历中找到 %d 个 xls 链接, 可用日期: %s",
+        len(links), ", ".join(sorted(d for _, d in links)),
+    )
 
     # 只取目标日期当天的 xls；取不到就不取其他日期
     target = date_str
@@ -139,13 +175,16 @@ def fetch_hkex_stampfx(date_str: str | None = None) -> dict:
         xls_url = xls_path
 
     logger.info("[HKEX] 下载 xls: %s", xls_url)
-    xls_resp = requests.get(xls_url, headers=_HEADERS, timeout=_TIMEOUT)
-    xls_resp.raise_for_status()
+    xls_resp = _http_get(xls_url)
+    logger.debug("[HKEX] xls 已下载, %d 字节", len(xls_resp.content or b""))
 
     rates = _parse_hkex_xls(xls_resp.content)
     if not rates:
         logger.warning("[HKEX] xls 解析无结果: %s", xls_url)
         return {}
+    logger.info("[HKEX] 解析到 %d 条印花税率: %s", len(rates), ", ".join(
+        f"{r['currency']}={r['hkd_rate']}" for r in rates
+    ))
 
     return {
         "date": target,
@@ -176,6 +215,7 @@ def _parse_hkex_xls(content: bytes) -> list[dict]:
     """
     wb = xlrd.open_workbook(file_contents=content)
     ws = wb.sheet_by_index(0)
+    logger.debug("[HKEX] xls 解析: sheet=%s, 共 %d 行", ws.name, ws.nrows)
 
     rates: list[dict] = []
     # 从 row 6 开始读取数据行（row 5 是表头）
@@ -226,6 +266,10 @@ def fetch_bochk_hkdrates() -> dict:
     logger.info("[BOCHK-HKD] 抓取港币电汇牌价")
     html = _fetch_bochk_iframe(BOCHK_HKDRATES_IFRAME)
     rates, update_time = _parse_bochk_rates_table(html)
+    logger.info(
+        "[BOCHK-HKD] 抓取完成: %d 条牌价, 资料更新时间=%s",
+        len(rates), update_time or "(未获取到)",
+    )
     return {"rates": rates, "update_time": update_time}
 
 
@@ -240,6 +284,10 @@ def fetch_bochk_fxrates() -> dict:
     logger.info("[BOCHK-FX] 抓取港币现钞牌价")
     html = _fetch_bochk_iframe(BOCHK_FXRATES_IFRAME)
     rates, update_time = _parse_bochk_rates_table(html)
+    logger.info(
+        "[BOCHK-FX] 抓取完成: %d 条牌价, 资料更新时间=%s",
+        len(rates), update_time or "(未获取到)",
+    )
     return {"rates": rates, "update_time": update_time}
 
 
@@ -260,6 +308,10 @@ def fetch_bochk_usdrates() -> dict:
         referer=BOCHK_USDRATES_PAGE,
     )
     rates, update_time = _parse_bochk_rates_table(html)
+    logger.info(
+        "[BOCHK-USD] 抓取完成: %d 条牌价, 资料更新时间=%s",
+        len(rates), update_time or "(未获取到)",
+    )
     return {"rates": rates, "update_time": update_time}
 
 
@@ -277,9 +329,8 @@ def _fetch_bochk_iframe(url: str, referer: str = "") -> str:
         **_HEADERS,
         "Referer": referer or BOCHK_HKDRATES_PAGE,
     }
-    resp = requests.get(url, headers=headers, timeout=_TIMEOUT)
+    resp = _http_get(url, headers=headers)
     resp.encoding = "utf-8"
-    resp.raise_for_status()
     return resp.text
 
 
@@ -305,6 +356,7 @@ def _parse_bochk_rates_table(html: str) -> tuple[list[dict], str]:
     """
     rates: list[dict] = []
     update_time = ""
+    skipped = 0
 
     # 提取更新时间
     time_match = re.search(
@@ -313,6 +365,8 @@ def _parse_bochk_rates_table(html: str) -> tuple[list[dict], str]:
     )
     if time_match:
         update_time = time_match.group(1).strip()
+    else:
+        logger.debug("[BOCHK] 未匹配到「資料更新於香港時間」字段")
 
     # 找到 form_table import-data 表格区域
     # 按 <tr> 分割，找到含三个 <td> 且后两个为数字的行
@@ -339,6 +393,11 @@ def _parse_bochk_rates_table(html: str) -> tuple[list[dict], str]:
         buy = _extract_number(buy_str)
 
         if sell is None and buy is None:
+            skipped += 1
+            logger.debug(
+                "[BOCHK] 跳过无汇率数字的行: %s (卖出=%r, 买入=%r)",
+                currency, sell_str, buy_str,
+            )
             continue
 
         rates.append({
@@ -347,6 +406,10 @@ def _parse_bochk_rates_table(html: str) -> tuple[list[dict], str]:
             "buy": buy,
         })
 
+    logger.debug(
+        "[BOCHK] 表格解析完成: %d 条有效, %d 行被跳过, 更新时间=%s",
+        len(rates), skipped, update_time or "(无)",
+    )
     return rates, update_time
 
 
@@ -445,11 +508,16 @@ def process_web_rates(
     if date_str is None:
         date_str = dt.date.today().strftime("%Y%m%d")
 
+    started_at = dt.datetime.now()
     logger.info("[WEB] 开始抓取汇率, date=%s", date_str)
 
     # 1. HKEx 印花税率
     hkex_data = fetch_hkex_stampfx(date_str)
     _print_hkex(hkex_data)
+    logger.info(
+        "[WEB] HKEx 印花税率: %s",
+        f"{len(hkex_data.get('rates', []))} 条" if hkex_data else "无数据",
+    )
 
     # 2. BOCHK 港币电汇牌价
     bochk_hkd = fetch_bochk_hkdrates()
@@ -466,8 +534,12 @@ def process_web_rates(
         out_path = out_dir / f"web_rates_{date_str}.txt"
         _save_to_file(out_path, hkex_data, bochk_hkd, bochk_fx)
         print(f"\n[WEB] 结果已保存到: {out_path}")
+        logger.info("[WEB] 结果已保存到: %s", out_path)
 
-    logger.info("[WEB] 抓取完成")
+    logger.info(
+        "[WEB] 抓取完成, 耗时 %.1fs",
+        (dt.datetime.now() - started_at).total_seconds(),
+    )
 
 
 def _save_to_file(
