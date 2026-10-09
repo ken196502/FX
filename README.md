@@ -10,6 +10,8 @@ uv run fxmail                       # 发送今日汇率邮件
 uv run fxmail --date 20260930       # 发送指定日期汇率邮件
 uv run fxmail --no-reuse            # 忽略当日缓存，强制重新抓取 BOCHK
 uv run fxmail --log-level DEBUG     # 排障：输出调试级别日志
+uv run fxmail --sftp-tree           # 只列出 SFTP 根目录第一层后退出（不发邮件）
+uv run fxmail --sftp-tree 20261009 --sftp-depth 2
 ```
 
 ## SFTP 上传
@@ -30,6 +32,18 @@ uv run fxmail --log-level DEBUG     # 排障：输出调试级别日志
 | `SFTP_PWD` | 登录密码 |
 
 未配置 `SFTP` / `SFTP_USER` 时跳过上传；上传失败只记日志并发企业微信通知，不影响已发出的邮件。
+
+### 查看 SFTP 目录树
+
+```bash
+uv run fxmail --sftp-tree                     # 整个 SFTP 根目录的第一层
+uv run fxmail --sftp-tree FX_Rates            # 只看 FX_Rates 这一层
+uv run fxmail --sftp-tree /FX_Rates --sftp-depth 2   # 需要更深层时显式指定
+```
+
+不带 PATH 时从整个 SFTP 根目录（登录后的默认目录，通常为 `/`）开始，**不套用 `SFTP_DIR`**；
+默认层级由 `sftp_upload.DEFAULT_TREE_DEPTH` 决定（当前 4），需要更深/更浅时用 `--sftp-depth N` 覆盖。
+`--sftp-tree` 只连 SFTP 打印目录后即退出，不抓汇率也不发邮件；文件名后附带大小与修改时间。
 
 ## 日志
 

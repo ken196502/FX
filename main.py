@@ -6,6 +6,8 @@ main.py - FX 汇率邮件发送入口
     uv run fxmail              # 发送今日汇率邮件
     uv run fxmail --date 20260930  # 发送指定日期汇率邮件
     uv run fxmail --log-level DEBUG --log-dir ./logs  # 排障：输出调试日志
+    uv run fxmail --sftp-tree          # 只列出 SFTP 根目录第一层后退出（不发邮件）
+    uv run fxmail --sftp-tree 20261009 --sftp-depth 2
 
 日志：
     运行日志同时写入控制台和文件（默认 ./logs/fx_YYYYMMDD.log，
@@ -26,6 +28,9 @@ SFTP 上传（环境变量，可选）：
     <SFTP_DIR>/<YYYYMMDD>/ 下（目录不存在自动创建）。
     未配置 SFTP / SFTP_USER 时跳过；上传失败只记日志并发企业微信通知，
     不影响已发出的邮件。
+    用 --sftp-tree [PATH] 可只列出 SFTP 目录后退出（不发邮件）：
+    PATH 省略表示整个 SFTP 根目录（登录后的默认目录，通常 /，不套用 SFTP_DIR），
+    默认层级由 sftp_upload.DEFAULT_TREE_DEPTH 决定，可用 --sftp-depth N 覆盖。
 
 抄送（环境变量，可选，多个地址用 , 或 ; 分隔）：
     FX_CC   - 完整汇率报告邮件（FX_RECIEVER 那封）的抄送人
@@ -79,7 +84,12 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 from log_setup import get_logger, log_file_path, setup_logging
 from ms_mail import send_mail
 from sc_infra import send_error
-from sftp_upload import sftp_enabled, upload_rate_file
+from sftp_upload import (
+    DEFAULT_TREE_DEPTH,
+    list_tree,
+    sftp_enabled,
+    upload_rate_file,
+)
 from rate_export import (
     DEFAULT_MARKDOWN_FACTOR,
     MARKDOWN_FACTORS,
@@ -91,7 +101,7 @@ from web_rates import (
     BOCHK_USDRATES_PAGE,
     HKEX_STAMPFX_URL,
 )
-from web_shot import cleanup_previous_shots
+from web_shot import cleanup_previous_shots, shot_captured_times
 
 logger = get_logger(__name__)
 
@@ -272,6 +282,8 @@ def _build_email_html(
     bochk_hkd_raw = result["bochk_hkd_raw"]
     bochk_usd_raw = result["bochk_usd_raw"]
     bochk_fx_raw = result.get("bochk_fx_raw") or {}
+    # 各牌价页截图的抓取时间，用于标明每行汇率的获取时间
+    shot_times = shot_captured_times(result.get("screenshots"))
     errors = result["errors"] if errors is None else errors
 
     date_display = date_val.strftime("%Y-%m-%d")
@@ -303,6 +315,7 @@ def _build_email_html(
         "计算公式：<b>L (Buy) = F × Mark down</b>，"
         "<b>N (Sell) = H × Mark up</b>；"
         "F = BOCHK 客户卖出价(Bid)，H = BOCHK 客户买入价(Ask)。"
+        "「获取时间」为该来源页截图的抓取时间，与附件中的页面截图一致。"
         "（数据来源见文末「数据来源」）</p>"
     )
     _th = "border: 1px solid #ddd; padding: 8px; text-align: center;"
@@ -316,6 +329,10 @@ def _build_email_html(
         f"<span style='{_sub}'>BOCHK 客户卖出价</span></th>"
         f"<th style='{_th}'>H (Ask)<br>"
         f"<span style='{_sub}'>BOCHK 客户买入价</span></th>"
+        f"<th style='{_th}'>来源页<br>"
+        f"<span style='{_sub}'>电汇 / 现钞</span></th>"
+        f"<th style='{_th}'>获取时间<br>"
+        f"<span style='{_sub}'>页面截图时间</span></th>"
         f"<th style='{_th}'>Mark down<br>"
         f"<span style='{_sub}'>因子</span></th>"
         f"<th style='{_th}'>Mark up<br>"
@@ -329,11 +346,13 @@ def _build_email_html(
     )
     for row in custom_rows:
         pair_key = f"{row['from_ccy']}/{row['to_ccy']}"
-        raw = _find_raw_rate(
+        raw, src_page, src_key = _find_raw_rate(
             pair_key, bochk_hkd_raw, bochk_usd_raw, bochk_fx_raw,
         )
         f_val = raw.get("bid", 0.0) if raw else 0.0
         h_val = raw.get("ask", 0.0) if raw else 0.0
+        # 获取时间直接取该来源页截图的抓取时间，保证与附件截图一致
+        got_at = shot_times.get(src_key, "") or "—"
         md, mu = MARKDOWN_FACTORS.get(pair_key, DEFAULT_MARKDOWN_FACTOR)
         # 因子为 1 时 Buy/Sell 就是 BOCHK 原始牌价，展示计算过程没有意义
         if md == 1.0 and mu == 1.0:
@@ -352,6 +371,10 @@ def _build_email_html(
             f"<td style='border: 1px solid #ddd; padding: 8px;'>{row['to_ccy']}</td>"
             f"<td style='border: 1px solid #ddd; padding: 8px;'>{f_val:.6f}</td>"
             f"<td style='border: 1px solid #ddd; padding: 8px;'>{h_val:.6f}</td>"
+            f"<td style='border: 1px solid #ddd; padding: 8px; "
+            f"white-space: nowrap;'>{src_page}</td>"
+            f"<td style='border: 1px solid #ddd; padding: 8px; "
+            f"white-space: nowrap;'>{got_at}</td>"
             f"<td style='border: 1px solid #ddd; padding: 8px;'>{md}</td>"
             f"<td style='border: 1px solid #ddd; padding: 8px;'>{mu}</td>"
             f"<td style='border: 1px solid #ddd; padding: 8px; color: #27ae60;'><b>{row['buy']:.6f}</b></td>"
@@ -550,8 +573,8 @@ def _find_raw_rate(
     bochk_hkd: dict[str, dict[str, float]],
     bochk_usd: dict[str, dict[str, float]],
     bochk_fx: dict[str, dict[str, float]] | None = None,
-) -> dict[str, float] | None:
-    """从 BOCHK 原始汇率字典中查找指定币种对的汇率。
+) -> tuple[dict[str, float] | None, str, str]:
+    """从 BOCHK 原始汇率字典中查找指定币种对的汇率、来源页与来源标识。
 
     依次在港币电汇牌价、美元电汇牌价、港币现钞牌价中查找。
 
@@ -562,16 +585,21 @@ def _find_raw_rate(
         bochk_fx: 港币现钞牌价字典 {币种代码: {"bid": F, "ask": H}}，可选
 
     Returns:
-        {"bid": float, "ask": float} 或 None
+        ({"bid": float, "ask": float} 或 None, 来源页, 来源标识)
+        来源页取值：
+          "电汇（港币电汇牌价）" / "电汇（美元电汇牌价）" /
+          "现钞（港币现钞牌价）" / "—"（未找到）
+        来源标识取值 "HKD" / "USD" / "FX" / ""，用于匹配页面截图的
+        抓取时间，其中 "HKD" / "USD" 均为电汇页
     """
     from_ccy, to_ccy = pair_key.split("/", 1)
     if to_ccy == "HKD" and from_ccy in bochk_hkd:
-        return bochk_hkd[from_ccy]
+        return bochk_hkd[from_ccy], "电汇（港币电汇牌价）", "HKD"
     if pair_key in bochk_usd:
-        return bochk_usd[pair_key]
+        return bochk_usd[pair_key], "电汇（美元电汇牌价）", "USD"
     if bochk_fx and to_ccy == "HKD" and from_ccy in bochk_fx:
-        return bochk_fx[from_ccy]
-    return None
+        return bochk_fx[from_ccy], "现钞（港币现钞牌价）", "FX"
+    return None, "—", ""
 
 
 # -----------------------------------------------------------------------
@@ -642,6 +670,37 @@ def _cleanup_old_screenshots(date_str: str) -> None:
         logger.info(
             "[FX] 已清理 %d 个历史日期(%s 之前)的 BOCHK 截图", removed, date_str,
         )
+
+
+def _print_sftp_tree(remote_dir: str, max_depth: int | None) -> int:
+    """打印 SFTP 上的目录树（--sftp-tree）。
+
+    Args:
+        remote_dir: 起始远端目录，空字符串表示整个 SFTP 根目录
+        max_depth: 最大递归层级，None 时用 list_tree 的默认值
+            （DEFAULT_TREE_DEPTH）
+
+    Returns:
+        进程退出码：0 成功，1 失败
+    """
+    if max_depth is not None and max_depth < 1:
+        print("错误: --sftp-depth 必须 >= 1", file=sys.stderr)
+        return 1
+    # 未指定 --sftp-depth 时不传参，交给 list_tree 的默认值
+    kwargs = {} if max_depth is None else {"max_depth": max_depth}
+    logger.info(
+        "[FX] --sftp-tree 列出目录树: path=%s, depth=%s",
+        remote_dir or "(整个 SFTP 根)",
+        max_depth if max_depth is not None else f"(默认 {DEFAULT_TREE_DEPTH})",
+    )
+    try:
+        lines = list_tree(remote_dir or None, **kwargs)
+    except Exception as exc:
+        logger.error("[FX] 列出 SFTP 目录树失败: %s", exc)
+        print(f"错误: 列出 SFTP 目录树失败: {exc}", file=sys.stderr)
+        return 1
+    print("\n".join(lines))
+    return 0
 
 
 def _upload_boc_excel_to_sftp(custom_path: Path | None, date_str: str) -> None:
@@ -746,6 +805,22 @@ def main() -> None:
         "--log-dir",
         help="日志目录，默认 ./logs（也可用 LOG_DIR）",
     )
+    parser.add_argument(
+        "--sftp-tree",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PATH",
+        help="只列出 SFTP 目录并退出（不发邮件）；PATH 缺省表示整个 SFTP 根目录，"
+             "也可指定子目录如 FX_Rates",
+    )
+    parser.add_argument(
+        "--sftp-depth",
+        type=int,
+        default=None,
+        metavar="N",
+        help=f"--sftp-tree 的递归层级，默认 {DEFAULT_TREE_DEPTH}",
+    )
     args = parser.parse_args()
 
     # 按命令行参数重新初始化日志（模块导入时已用默认配置过一次）
@@ -757,6 +832,10 @@ def main() -> None:
         args.log_level or "(默认 INFO)",
     )
     logger.info("[FX] 日志文件: %s", log_file_path() or "(仅控制台)")
+
+    # 仅列出 SFTP 目录树：连上 SFTP 打印后直接退出，不做汇率/邮件流程
+    if args.sftp_tree is not None:
+        sys.exit(_print_sftp_tree(args.sftp_tree, args.sftp_depth))
 
     date_str = args.date
     if date_str is None:

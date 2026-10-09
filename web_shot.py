@@ -47,6 +47,14 @@ SHOT_TARGETS: tuple[tuple[str, str, str], ...] = (
     ),
 )
 
+# 截图文件名前缀 → 数据来源标识
+# 用于邮件正文按「电汇/现钞」来源页标注每条汇率的获取时间
+SHOT_SOURCE_KEYS: dict[str, str] = {
+    "bochk_hkd_rates": "HKD",
+    "bochk_usd_rates": "USD",
+    "bochk_fx_rates": "FX",
+}
+
 # 浏览器启动候选：依次尝试，第一个可用的即可
 # 优先系统 Chrome，其次 Edge，最后才用 playwright 自带的 chromium
 _BROWSER_CHANNELS: tuple[str | None, ...] = ("chrome", "msedge", None)
@@ -93,6 +101,26 @@ def _shot_time(path: Path) -> str:
     return dt.datetime.fromtimestamp(path.stat().st_mtime).strftime(
         "%Y-%m-%d %H:%M"
     )
+
+
+def shot_captured_times(shots: list[dict] | None) -> dict[str, str]:
+    """按数据来源标识汇总截图的抓取时间。
+
+    Args:
+        shots: resolve_rate_page_shots / existing_rate_page_shots
+            返回的截图列表，每项含 path / captured_at
+
+    Returns:
+        {"HKD": "YYYY-MM-DD HH:MM", "USD": ..., "FX": ...}；
+        某个来源页没有截图时不含该键
+    """
+    times: dict[str, str] = {}
+    for shot in shots or []:
+        prefix = Path(shot["path"]).name.rsplit("_", 1)[0]
+        key = SHOT_SOURCE_KEYS.get(prefix)
+        if key and key not in times:
+            times[key] = shot.get("captured_at", "")
+    return times
 
 
 def _shot_path(output_dir: Path, prefix: str, date_str: str) -> Path:
