@@ -12,6 +12,25 @@ uv run fxmail --no-reuse            # 忽略当日缓存，强制重新抓取 BO
 uv run fxmail --log-level DEBUG     # 排障：输出调试级别日志
 ```
 
+## SFTP 上传
+
+给 BOC_RECIEVER 发「仅自定义汇率」邮件时，同时把该 Excel 上传到 SFTP：
+
+```
+<SFTP_DIR>/<YYYYMMDD>/自定义汇率<yymmdd>.xlsx
+```
+
+例如 `FX_Rates/20261009/自定义汇率261009.xlsx`（目录不存在会自动创建）。
+
+| 环境变量 | 说明 |
+| --- | --- |
+| `SFTP` | SFTP 地址 `host[:port]`，如 `10.202.5.244:2022`（端口默认 22） |
+| `SFTP_DIR` | SFTP 根目录，如 `FX_Rates` |
+| `SFTP_USER` | 登录用户名 |
+| `SFTP_PWD` | 登录密码 |
+
+未配置 `SFTP` / `SFTP_USER` 时跳过上传；上传失败只记日志并发企业微信通知，不影响已发出的邮件。
+
 ## 日志
 
 所有模块统一通过 `log_setup.py` 输出日志：

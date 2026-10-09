@@ -20,6 +20,18 @@ main.py - FX 汇率邮件发送入口
     两者都配置时，一次运行会给两边各发一封：FX_RECIEVER 收完整报告，
     BOC_RECIEVER 只收自定义汇率部分。
 
+SFTP 上传（环境变量，可选）：
+    SFTP=host[:port] / SFTP_DIR / SFTP_USER / SFTP_PWD
+    给 BOC_RECIEVER 发出「仅自定义汇率」邮件后，会把该 Excel 同步上传到
+    <SFTP_DIR>/<YYYYMMDD>/ 下（目录不存在自动创建）。
+    未配置 SFTP / SFTP_USER 时跳过；上传失败只记日志并发企业微信通知，
+    不影响已发出的邮件。
+
+抄送（环境变量，可选，多个地址用 , 或 ; 分隔）：
+    FX_CC   - 完整汇率报告邮件（FX_RECIEVER 那封）的抄送人
+    BOC_CC  - 仅自定义汇率邮件（BOC_RECIEVER 那封）的抄送人
+    未配置时不抄送；抄送地址与收件人相同时会自动去重，不会重复收到。
+
 流程：
     1. 从 BOCHK / HKEx 网站获取汇率
     2. 按 TFISF Excel 公式计算自定义汇率
@@ -67,6 +79,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 from log_setup import get_logger, log_file_path, setup_logging
 from ms_mail import send_mail
 from sc_infra import send_error
+from sftp_upload import sftp_enabled, upload_rate_file
 from rate_export import (
     DEFAULT_MARKDOWN_FACTOR,
     MARKDOWN_FACTORS,
@@ -92,7 +105,7 @@ def _env(key: str) -> str:
 
 
 def _recipients(*keys: str) -> list[str]:
-    """读取收件人环境变量，支持多个地址用 , / ; / 空白分隔。
+    """读取收件人/抄送人环境变量，支持多个地址用 , / ; / 空白分隔。
 
     依次尝试给定的环境变量名（兼容 RECIEVER / RECEIVER 两种拼写），
     所有非空变量中的邮箱都会合并；多个邮箱地址可用逗号、分号或空格分隔。
@@ -116,7 +129,7 @@ def _recipients(*keys: str) -> list[str]:
             if not addr:
                 continue
             if "@" not in addr or "." not in addr.rsplit("@", 1)[-1]:
-                logger.warning("[FX] 忽略无效的收件人地址 (%s): %s", key, addr)
+                logger.warning("[FX] 忽略无效的邮箱地址 (%s): %s", key, addr)
                 continue
             key_l = addr.lower()
             if key_l in seen:
@@ -124,7 +137,7 @@ def _recipients(*keys: str) -> list[str]:
             seen.add(key_l)
             parsed.append(addr)
         logger.info(
-            "[FX] %s 解析到 %d 个收件人: %s", key, len(parsed), ", ".join(parsed),
+            "[FX] %s 解析到 %d 个地址: %s", key, len(parsed), ", ".join(parsed),
         )
         result.extend(parsed)
 
@@ -570,6 +583,7 @@ def _send_rate_mail(
     subject: str,
     body_html: str,
     attachments: list[Path],
+    cc: list[str] | None = None,
 ) -> bool:
     """发送汇率邮件（带 xlsx 附件）。
 
@@ -578,13 +592,15 @@ def _send_rate_mail(
         subject: 邮件主题
         body_html: 邮件正文 HTML
         attachments: 附件路径列表
+        cc: 抄送邮箱地址列表，None 表示不抄送
 
     Returns:
         True 表示发送成功；发送失败时抛出异常
     """
     logger.info(
-        "[FX] 发送邮件到 %s: %s (附件 %d 个)",
-        ", ".join(recipients), subject, len(attachments or []),
+        "[FX] 发送邮件到 %s (抄送 %s): %s (附件 %d 个)",
+        ", ".join(recipients), ", ".join(cc) if cc else "(无)",
+        subject, len(attachments or []),
     )
     logger.debug(
         "[FX] 附件清单: %s",
@@ -595,8 +611,14 @@ def _send_rate_mail(
         body_html=body_html,
         recipients=recipients,
         attachments=attachments,
+        cc_recipients=cc,
     )
-    logger.info("✅ 邮件已发送到 %s: %s", ", ".join(recipients), subject)
+    logger.info(
+        "✅ 邮件已发送到 %s%s: %s",
+        ", ".join(recipients),
+        f"（抄送 {', '.join(cc)}）" if cc else "",
+        subject,
+    )
     return True
 
 
@@ -622,11 +644,44 @@ def _cleanup_old_screenshots(date_str: str) -> None:
         )
 
 
+def _upload_boc_excel_to_sftp(custom_path: Path | None, date_str: str) -> None:
+    """把仅自定义汇率（BOC）的 Excel 上传到 SFTP 的日期目录下。
+
+    远端路径为 <SFTP_DIR>/<YYYYMMDD>/<文件名>，目录不存在时自动创建。
+    未配置 SFTP 环境变量时直接跳过；上传失败只记录错误并发企业微信通知，
+    不影响已发出的 BOC 汇率邮件。
+
+    Args:
+        custom_path: 自定义汇率 xlsx 本地路径，None 或文件不存在时跳过
+        date_str: 目标日期 YYYYMMDD，用作 SFTP 上的子目录名
+    """
+    if not custom_path or not Path(custom_path).exists():
+        logger.warning(
+            "[FX] 自定义汇率文件不存在，跳过 SFTP 上传 (date=%s, path=%s)",
+            date_str, custom_path,
+        )
+        return
+    if not sftp_enabled():
+        logger.info("[FX] 未配置 SFTP（SFTP / SFTP_USER），跳过上传")
+        return
+    try:
+        remote_path = upload_rate_file(Path(custom_path), date_str)
+    except Exception as exc:
+        logger.error("[FX] 上传自定义汇率到 SFTP 失败: %s", exc)
+        try:
+            send_error(f"【汇率导出异常 {date_str}】SFTP 上传失败: {exc}")
+        except Exception as we:
+            logger.error("[FX] 企业微信错误通知发送失败: %s", we)
+        return
+    logger.info("[FX] 自定义汇率已上传到 SFTP: %s", remote_path)
+
+
 def _send_error_report(
     recipients: list[str],
     errors: list[str],
     date_str: str,
     traceback_text: str = "",
+    cc: list[str] | None = None,
 ) -> None:
     """发送数据异常的错误报告邮件（不带汇率附件）。
 
@@ -635,13 +690,15 @@ def _send_error_report(
         errors: 错误信息列表
         date_str: 目标日期 YYYYMMDD
         traceback_text: 异常堆栈文本，可为空
+        cc: 抄送邮箱地址列表，None 表示不抄送
     """
     subject = f"【错误报告】汇率报告 — {_date_display(date_str)} 数据异常"
     html_body = _build_error_email_html(errors, date_str, traceback_text)
 
     logger.error(
-        "发送错误报告邮件到 %s: %s (错误 %d 条)",
-        ", ".join(recipients), subject, len(errors),
+        "发送错误报告邮件到 %s (抄送 %s): %s (错误 %d 条)",
+        ", ".join(recipients), ", ".join(cc) if cc else "(无)",
+        subject, len(errors),
     )
     for e in errors:
         logger.error("[FX] 错误明细: %s", e)
@@ -650,9 +707,13 @@ def _send_error_report(
         body_html=html_body,
         recipients=recipients,
         attachments=None,
+        cc_recipients=cc,
     )
     logger.warning(
-        "⚠ 错误报告邮件已发送到 %s: %s", ", ".join(recipients), subject,
+        "⚠ 错误报告邮件已发送到 %s%s: %s",
+        ", ".join(recipients),
+        f"（抄送 {', '.join(cc)}）" if cc else "",
+        subject,
     )
 
 
@@ -711,6 +772,19 @@ def main() -> None:
     fx_recipients = _recipients("FX_RECIEVER", "FX_RECEIVER")
     # BOC_RECIEVER 只接收自定义汇率（BOCHK），不依赖 HKEx 数据
     boc_recipients = _recipients("BOC_RECIEVER", "BOC_RECEIVER")
+    # 抄送人（可选）：FX_CC 对应完整汇率报告，BOC_CC 对应仅自定义汇率邮件
+    fx_cc = _recipients("FX_CC")
+    boc_cc = _recipients("BOC_CC")
+    if not fx_recipients and fx_cc:
+        logger.warning(
+            "[FX] 配置了 FX_CC 但没有 FX_RECIEVER/FX_RECEIVER，"
+            "完整汇率邮件不会发出，抄送 %s 不生效", ", ".join(fx_cc),
+        )
+    if not boc_recipients and boc_cc:
+        logger.warning(
+            "[FX] 配置了 BOC_CC 但没有 BOC_RECIEVER/BOC_RECEIVER，"
+            "仅自定义汇率邮件不会发出，抄送 %s 不生效", ", ".join(boc_cc),
+        )
     if not fx_recipients and not boc_recipients:
         logger.error(
             "FX_RECIEVER / FX_RECEIVER / BOC_RECIEVER / BOC_RECEIVER "
@@ -734,7 +808,10 @@ def main() -> None:
     )
 
     try:
-        failed = _run(args, date_str, fx_recipients, boc_recipients, include_hkex)
+        failed = _run(
+            args, date_str, fx_recipients, boc_recipients, include_hkex,
+            fx_cc, boc_cc,
+        )
     except Exception:
         logger.exception("[FX] 运行过程出现未捕获异常")
         if not args.no_wechat:
@@ -762,6 +839,8 @@ def _run(
     fx_recipients: list[str],
     boc_recipients: list[str],
     include_hkex: bool,
+    fx_cc: list[str] | None = None,
+    boc_cc: list[str] | None = None,
 ) -> bool:
     """执行「抓汇率 → 生成 Excel → 发邮件」主流程。
 
@@ -771,6 +850,8 @@ def _run(
         fx_recipients: 完整汇率报告收件人（自定义 + 交易所）
         boc_recipients: 仅自定义汇率收件人
         include_hkex: 是否抓取 HKEx 印花税率
+        fx_cc: 完整汇率报告邮件的抄送人
+        boc_cc: 仅自定义汇率邮件的抄送人
 
     Returns:
         True 表示本次运行存在失败（调用方据此返回退出码 1）
@@ -839,13 +920,17 @@ def _run(
             attachments += [
                 s["path"] for s in (result.get("screenshots") or [])
             ]
-            _send_rate_mail(fx_recipients, subject, html_body, attachments)
+            _send_rate_mail(
+                fx_recipients, subject, html_body, attachments, cc=fx_cc,
+            )
 
     # 3. BOC_RECIEVER: 只发自定义汇率 — HKEx 的异常不影响该邮件
     if boc_recipients:
         boc_errors = [e for e in errors if not e.startswith("HKEx")]
         if boc_errors:
-            _send_error_report(boc_recipients, boc_errors, date_str, tb_text)
+            _send_error_report(
+                boc_recipients, boc_errors, date_str, tb_text, cc=boc_cc,
+            )
             failed = True
         elif result is None:
             # 汇率结果为空（如流程异常且错误都被归到 HKEx），不能发空邮件
@@ -868,7 +953,11 @@ def _run(
             boc_attachments += [
                 s["path"] for s in (result.get("screenshots") or [])
             ]
-            _send_rate_mail(boc_recipients, subject, html_body, boc_attachments)
+            _send_rate_mail(
+                boc_recipients, subject, html_body, boc_attachments, cc=boc_cc,
+            )
+            # BOC（仅自定义汇率）的 Excel 同步放到 SFTP 的 YYYYMMDD 目录下
+            _upload_boc_excel_to_sftp(result["custom_path"], date_str)
 
     if errors:
         logger.warning("[FX] 本次共收集到 %d 条错误", len(errors))

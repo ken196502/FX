@@ -13,9 +13,12 @@ ms_mail.py - 通过 Microsoft Graph API 发送邮件
   FX_RECIEVER      - 收件邮箱地址（完整汇率报告），也支持 FX_RECEIVER 拼写
   BOC_RECIEVER     - 收件邮箱地址（仅自定义汇率，BOCHK 来源），
                      也支持 BOC_RECEIVER 拼写
+  FX_CC            - 抄送邮箱地址（完整汇率报告邮件），可选
+  BOC_CC           - 抄送邮箱地址（仅自定义汇率邮件），可选
 
-收件人环境变量支持多个邮箱地址，用 , 或 ; 分隔，
-统一转换为 Graph API 的 toRecipients 列表（即一封邮件多个收件人）。
+收件人 / 抄送人环境变量都支持多个邮箱地址，用 , 或 ; 分隔，
+统一转换为 Graph API 的 toRecipients / ccRecipients 列表
+（即一封邮件多个收件人、多个抄送人）。
 """
 
 from __future__ import annotations
@@ -91,12 +94,29 @@ def _guess_content_type(suffix: str) -> str:
     return mapping.get(suffix.lower(), "application/octet-stream")
 
 
+def _clean_addresses(addresses: list[str] | None) -> list[str]:
+    """清洗邮箱地址列表：去空白 / 引号，丢弃空字符串。
+
+    Args:
+        addresses: 原始邮箱地址列表，可为 None
+
+    Returns:
+        清洗后的邮箱地址列表
+    """
+    return [
+        a.strip().strip('"').strip("'")
+        for a in (addresses or [])
+        if a and a.strip()
+    ]
+
+
 def send_mail(
     subject: str,
     body_html: str,
     recipients: list[str],
     attachments: list[Path] | None = None,
     sender: str | None = None,
+    cc_recipients: list[str] | None = None,
 ) -> dict:
     """通过 Microsoft Graph API 发送邮件。
 
@@ -109,6 +129,8 @@ def send_mail(
         recipients: 收件人邮箱地址列表
         attachments: 附件文件路径列表
         sender: 发件邮箱地址，None 则使用 MS_MAILBOX/SENDER
+        cc_recipients: 抄送人邮箱地址列表，None / 空表示不抄送；
+            已在收件人中的地址会自动去重，不会重复出现在抄送里
 
     Returns:
         Graph API 返回的 JSON 字典
@@ -118,13 +140,26 @@ def send_mail(
     if not mbox:
         raise RuntimeError("未指定发件邮箱地址 (MS_MAILBOX/SENDER 未配置)")
 
-    recipients = [a.strip() for a in (recipients or []) if a and a.strip()]
+    recipients = _clean_addresses(recipients)
     if not recipients:
         raise ValueError("收件人为空，无法发送邮件")
 
     to_recipients = [
         {"emailAddress": {"address": addr}}
         for addr in recipients
+    ]
+
+    # 抄送：去掉已在收件人中的地址，避免同一个人同时收到收件和抄送
+    to_lower = {addr.lower() for addr in recipients}
+    cc: list[str] = []
+    for addr in _clean_addresses(cc_recipients):
+        if addr.lower() in to_lower:
+            logger.debug("[MS Mail] 抄送地址已在收件人中，跳过: %s", addr)
+            continue
+        to_lower.add(addr.lower())
+        cc.append(addr)
+    cc_recipients_payload = [
+        {"emailAddress": {"address": addr}} for addr in cc
     ]
 
     message: dict = {
@@ -135,6 +170,8 @@ def send_mail(
         },
         "toRecipients": to_recipients,
     }
+    if cc_recipients_payload:
+        message["ccRecipients"] = cc_recipients_payload
 
     if attachments:
         message["attachments"] = [_build_attachment(p) for p in attachments]
@@ -147,8 +184,8 @@ def send_mail(
     payload = {"message": message, "saveToSentItems": True}
 
     logger.info(
-        "[MS Mail] 发送邮件: from=%s, to=%s, subject=%s, attachments=%d",
-        mbox, recipients, subject, len(attachments or []),
+        "[MS Mail] 发送邮件: from=%s, to=%s, cc=%s, subject=%s, attachments=%d",
+        mbox, recipients, cc or "(无)", subject, len(attachments or []),
     )
     logger.debug("[MS Mail] 请求地址: %s", url)
     for path in attachments or []:
