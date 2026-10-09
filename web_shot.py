@@ -103,15 +103,19 @@ def _shot_time(path: Path) -> str:
     )
 
 
-def shot_captured_times(shots: list[dict] | None) -> dict[str, str]:
+def shot_captured_times(
+    shots: list[dict] | None,
+    time_only: bool = True,
+) -> dict[str, str]:
     """按数据来源标识汇总截图的抓取时间。
 
     Args:
         shots: resolve_rate_page_shots / existing_rate_page_shots
             返回的截图列表，每项含 path / captured_at
+        time_only: True 只保留 HH:MM，False 保留完整 "YYYY-MM-DD HH:MM"
 
     Returns:
-        {"HKD": "YYYY-MM-DD HH:MM", "USD": ..., "FX": ...}；
+        {"HKD": "HH:MM", "USD": ..., "FX": ...}；
         某个来源页没有截图时不含该键
     """
     times: dict[str, str] = {}
@@ -119,7 +123,8 @@ def shot_captured_times(shots: list[dict] | None) -> dict[str, str]:
         prefix = Path(shot["path"]).name.rsplit("_", 1)[0]
         key = SHOT_SOURCE_KEYS.get(prefix)
         if key and key not in times:
-            times[key] = shot.get("captured_at", "")
+            captured = shot.get("captured_at", "")
+            times[key] = captured.split(" ")[-1] if time_only else captured
     return times
 
 

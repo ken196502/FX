@@ -586,19 +586,17 @@ def _find_raw_rate(
 
     Returns:
         ({"bid": float, "ask": float} 或 None, 来源页, 来源标识)
-        来源页取值：
-          "电汇（港币电汇牌价）" / "电汇（美元电汇牌价）" /
-          "现钞（港币现钞牌价）" / "—"（未找到）
+        来源页取值："电汇" / "现钞" / "—"（未找到）
         来源标识取值 "HKD" / "USD" / "FX" / ""，用于匹配页面截图的
         抓取时间，其中 "HKD" / "USD" 均为电汇页
     """
     from_ccy, to_ccy = pair_key.split("/", 1)
     if to_ccy == "HKD" and from_ccy in bochk_hkd:
-        return bochk_hkd[from_ccy], "电汇（港币电汇牌价）", "HKD"
+        return bochk_hkd[from_ccy], "电汇", "HKD"
     if pair_key in bochk_usd:
-        return bochk_usd[pair_key], "电汇（美元电汇牌价）", "USD"
+        return bochk_usd[pair_key], "电汇", "USD"
     if bochk_fx and to_ccy == "HKD" and from_ccy in bochk_fx:
-        return bochk_fx[from_ccy], "现钞（港币现钞牌价）", "FX"
+        return bochk_fx[from_ccy], "现钞", "FX"
     return None, "—", ""
 
 
