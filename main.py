@@ -362,23 +362,23 @@ def _build_email_html(
             )
         else:
             calc = (
-                f"L = {f_val:.6f} × {md} = {row['buy']:.6f}"
-                f"<br>N = {h_val:.6f} × {mu} = {row['sell']:.6f}"
+                f"L = {f_val:.7f} × {md} = {row['buy']:.7f}"
+                f"<br>N = {h_val:.7f} × {mu} = {row['sell']:.7f}"
             )
         parts.append(
             f"<tr>"
             f"<td style='border: 1px solid #ddd; padding: 8px;'>{row['from_ccy']}</td>"
             f"<td style='border: 1px solid #ddd; padding: 8px;'>{row['to_ccy']}</td>"
-            f"<td style='border: 1px solid #ddd; padding: 8px;'>{f_val:.6f}</td>"
-            f"<td style='border: 1px solid #ddd; padding: 8px;'>{h_val:.6f}</td>"
+            f"<td style='border: 1px solid #ddd; padding: 8px;'>{f_val:.7f}</td>"
+            f"<td style='border: 1px solid #ddd; padding: 8px;'>{h_val:.7f}</td>"
             f"<td style='border: 1px solid #ddd; padding: 8px; "
             f"white-space: nowrap;'>{src_page}</td>"
             f"<td style='border: 1px solid #ddd; padding: 8px; "
             f"white-space: nowrap;'>{got_at}</td>"
             f"<td style='border: 1px solid #ddd; padding: 8px;'>{md}</td>"
             f"<td style='border: 1px solid #ddd; padding: 8px;'>{mu}</td>"
-            f"<td style='border: 1px solid #ddd; padding: 8px; color: #27ae60;'><b>{row['buy']:.6f}</b></td>"
-            f"<td style='border: 1px solid #ddd; padding: 8px; color: #e74c3c;'><b>{row['sell']:.6f}</b></td>"
+            f"<td style='border: 1px solid #ddd; padding: 8px; color: #27ae60;'><b>{row['buy']:.7f}</b></td>"
+            f"<td style='border: 1px solid #ddd; padding: 8px; color: #e74c3c;'><b>{row['sell']:.7f}</b></td>"
             f"<td style='border: 1px solid #ddd; padding: 8px; font-size: 12px;'>{calc}</td>"
             f"</tr>"
         )
@@ -411,8 +411,8 @@ def _build_email_html(
                 f"<td style='border: 1px solid #ddd; padding: 8px;'>{row['from_ccy']}</td>"
                 f"<td style='border: 1px solid #ddd; padding: 8px;'>{row['to_ccy']}</td>"
                 f"<td style='border: 1px solid #ddd; padding: 8px;'>{row['unit']}</td>"
-                f"<td style='border: 1px solid #ddd; padding: 8px;'>{row['buy']:.6f}</td>"
-                f"<td style='border: 1px solid #ddd; padding: 8px;'>{row['sell']:.6f}</td>"
+                f"<td style='border: 1px solid #ddd; padding: 8px;'>{row['buy']:.7f}</td>"
+                f"<td style='border: 1px solid #ddd; padding: 8px;'>{row['sell']:.7f}</td>"
                 f"</tr>"
             )
         parts.append("</table>")
