@@ -733,6 +733,39 @@ def _upload_boc_excel_to_sftp(custom_path: Path | None, date_str: str) -> None:
     logger.info("[FX] 自定义汇率已上传到 SFTP: %s", remote_path)
 
 
+def _upload_custom_to_sftp(date_str: str) -> int:
+    """只把 temp 里的自定义汇率 Excel 上传到 SFTP 后退出，不发邮件。
+
+    远端路径与 --upload-boc 一致：<SFTP_DIR>/<YYYYMMDD>/<文件名>。
+    找不到本地文件或未配置 SFTP 时报错退出（退出码 1）。
+
+    Args:
+        date_str: 目标日期 YYYYMMDD，用作 SFTP 上的子目录名
+
+    Returns:
+        进程退出码：0 成功，1 失败
+    """
+    yymmdd = date_str[2:]
+    local_path = _TEMP_DIR / f"自定义汇率{yymmdd}.xlsx"
+    if not local_path.exists():
+        logger.error("[FX] 本地自定义汇率文件不存在: %s", local_path)
+        print(f"错误: 本地自定义汇率文件不存在: {local_path}", file=sys.stderr)
+        return 1
+    if not sftp_enabled():
+        logger.error("[FX] 未配置 SFTP（缺少 SFTP / SFTP_USER），无法上传")
+        print("错误: 未配置 SFTP（缺少 SFTP / SFTP_USER）", file=sys.stderr)
+        return 1
+    try:
+        remote_path = upload_rate_file(local_path, date_str)
+    except Exception as exc:
+        logger.error("[FX] 上传自定义汇率到 SFTP 失败: %s", exc)
+        print(f"错误: 上传自定义汇率到 SFTP 失败: {exc}", file=sys.stderr)
+        return 1
+    logger.info("[FX] 自定义汇率已上传到 SFTP: %s -> %s", local_path, remote_path)
+    print(f"已上传: {local_path} -> {remote_path}")
+    return 0
+
+
 def _send_error_report(
     recipients: list[str],
     errors: list[str],
@@ -813,6 +846,12 @@ def main() -> None:
              "也可指定子目录如 FX_Rates",
     )
     parser.add_argument(
+        "--upload-sftp",
+        metavar="YYYYMMDD",
+        help="只把 temp 里的自定义汇率(自定义汇率{yymmdd}.xlsx)上传到 SFTP 并退出，"
+             "不抓取、不发邮件、不发企业微信",
+    )
+    parser.add_argument(
         "--sftp-depth",
         type=int,
         default=None,
@@ -834,6 +873,17 @@ def main() -> None:
     # 仅列出 SFTP 目录树：连上 SFTP 打印后直接退出，不做汇率/邮件流程
     if args.sftp_tree is not None:
         sys.exit(_print_sftp_tree(args.sftp_tree, args.sftp_depth))
+
+    # 仅上传 temp 里的自定义汇率到 SFTP：不做汇率抓取，不发邮件/企业微信
+    if args.upload_sftp:
+        date_str = args.upload_sftp
+        try:
+            _date_display(date_str)
+        except ValueError:
+            logger.error("日期格式不正确 %s (应为 YYYYMMDD)", date_str)
+            print(f"错误: 日期格式不正确 {date_str} (应为 YYYYMMDD)", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(_upload_custom_to_sftp(date_str))
 
     date_str = args.date
     if date_str is None:
