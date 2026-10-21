@@ -3,14 +3,14 @@ smb_upload.py - 通过 SMB 上传汇率 Excel
 ========================================
 
 读取 .env 中的 SMB 配置，把生成的汇率 Excel 上传到 SMB 共享目录下的
-日期子目录（YYYYMMDD）：
+年/日期子目录（YYYY/YYYYMMDD）：
 
-    <SMB_DIR>/<YYYYMMDD>/<文件名>
+    <SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/<文件名>
 
-例如 SMB=\\10.202.5.244\FX_Rates、日期 20261009 时，自定义汇率261009.xlsx
+例如 SMB_SERVER=\\10.202.5.244\FX_Rates、日期 20261009 时，自定义汇率261009.xlsx
 上传到：
 
-    FX_Rates/20261009/自定义汇率261009.xlsx
+    FX_Rates/2026/20261009/自定义汇率261009.xlsx
 
 所需环境变量：
   SMB_SERVER   - 服务器地址，可写成 "10.202.5.244" / "10.202.5.244/FX_Rates"
@@ -419,15 +419,15 @@ def upload_rate_file(
     date_str: str,
     remote_base: str | None = None,
 ) -> str | None:
-    """把汇率 Excel 上传到 SMB 的 <根目录>/<YYYYMMDD>/ 下（不重复上传）。
+    """把汇率 Excel 上传到 SMB 的 <根目录>/<YYYY>/<YYYYMMDD>/ 下（不重复上传）。
 
     远端已存在同名文件且字节数与本地一致时跳过，不重复上传；
     字节数不一致时重新上传。
 
     Args:
         file_path: 本地 Excel 文件路径，远端沿用其文件名
-        date_str: 目标日期 YYYYMMDD，用作 SMB 上的子目录名
-        remote_base: SMB 根目录，None 时取环境变量 SMB_DIR（默认空，
+        date_str: 目标日期 YYYYMMDD，用作 SMB 上的子目录名（按年再分一层）
+        remote_base: SMB 根目录，None 时取环境变量 SMB_REMOTE_DIR（默认空，
             表示共享根目录）
 
     Returns:
@@ -443,7 +443,10 @@ def upload_rate_file(
 
     base = (remote_base if remote_base is not None else _smb_remote_dir())
     base = base.replace("\\", "/").strip("/")
-    remote_path = "/".join(p for p in (base, date_str, local_path.name) if p)
+    # 目录层级：<根目录>/<YYYY>/<YYYYMMDD>/<文件名>
+    remote_path = "/".join(
+        p for p in (base, date_str[:4], date_str, local_path.name) if p
+    )
 
     local_size = local_path.stat().st_size
     with _open_tree() as tree:

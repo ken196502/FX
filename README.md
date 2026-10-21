@@ -52,7 +52,7 @@ uv run fxmail --sftp-tree /FX_Rates --sftp-depth 2   # 需要更深层时显式�
 `uv run fxmail` 不带 `--mail` 时默认执行本流程（`--upload-smb YYYYMMDD` 与它完全一致，只是显式指定日期）：
 
 1. **当天还没抓取过**（`temp/` 里没有当天两个 Excel）：先尝试抓取——**银行（BOCHK）和交易所（HKEx）都抓**，在 `temp/` 生成 `自定义汇率<yymmdd>.xlsx` 与 `交易所汇率<yymmdd>.xlsx`；
-2. **已配置 SMB**：把当天已抓取的汇率 Excel 上传到 `<SMB_REMOTE_DIR>/<YYYYMMDD>/`，**远端已存在同大小同名文件时跳过，不重复上传**；大小不一致才重新上传；
+2. **已配置 SMB**：把当天已抓取的汇率 Excel 上传到 `<SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/`，**远端已存在同大小同名文件时跳过，不重复上传**；大小不一致才重新上传；
 3. **未配置 SMB**：只在本地生成 Excel，不上传。
 
 任一文件上传失败都会记日志、发企业微信通知并以退出码 1 结束，不做静默兜底。
@@ -65,7 +65,7 @@ uv run fxmail --sftp-tree /FX_Rates --sftp-depth 2   # 需要更深层时显式�
 | `SMB_USERNAME` | 登录用户名 |
 | `SMB_PASSWORD` | 登录密码 |
 
-远端布局与 SFTP 一致，例如 `FX_Rates/20261009/自定义汇率261009.xlsx`（目录不存在会自动创建）。
+远端布局为 `<SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/<文件名>`，例如 `FX_Rates/2026/20261009/自定义汇率261009.xlsx`（目录不存在会自动创建）。
 
 邮件流程（抓取 → 生成 Excel → 按收件人发邮件 → SFTP 上传）改用 `--mail` 触发，行为与之前一致。
 

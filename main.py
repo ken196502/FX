@@ -43,7 +43,7 @@ SFTP 上传（环境变量，可选）：
 SMB 上传（默认流程，可选）：
     SMB_SERVER / SMB_SHARE / SMB_REMOTE_DIR / SMB_USERNAME / SMB_PASSWORD
     默认流程会把当天已抓取的汇率 Excel（自定义汇率 + 交易所汇率）上传到
-    <SMB_REMOTE_DIR>/<YYYYMMDD>/ 下，远端已存在同大小同名文件时跳过，
+    <SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/ 下，远端已存在同大小同名文件时跳过，
     不重复上传；当天还没抓取过时会先尝试抓取（银行 BOCHK 与交易所
     HKEx 都抓）。未配置 SMB 时只在本地生成 Excel，不上传。
 
@@ -792,7 +792,7 @@ def _run_smb_mode(args: argparse.Namespace, date_str: str) -> int:
     1. 当天还没有抓取过汇率 Excel 时，先尝试抓取——银行（BOCHK）和
        交易所（HKEx）都要，在 temp/ 生成本地文件；
     2. 已配置 SMB 时把当天已抓取的汇率 Excel（自定义汇率 + 交易所汇率）
-       上传到 <SMB_REMOTE_DIR>/<YYYYMMDD>/ 下，远端已存在同大小同名
+       上传到 <SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/ 下，远端已存在同大小同名
        文件时跳过，不重复上传；
     3. 未配置 SMB 时只在本地生成 Excel，不上传。
 
@@ -1016,7 +1016,7 @@ def main() -> None:
         metavar="YYYYMMDD",
         help="SMB 流程（与不带参数的默认流程一致）：当天没抓取过则先尝试抓取"
              "（银行 BOCHK + 交易所 HKEx）；已配置 SMB 时把汇率 Excel 上传到 "
-             "<SMB_REMOTE_DIR>/<YYYYMMDD>/，远端已存在同大小文件时跳过；"
+             "<SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/，远端已存在同大小文件时跳过；"
              "未配置 SMB 时只在本地生成 Excel",
     )
     parser.add_argument(
