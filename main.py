@@ -3,8 +3,11 @@ main.py - FX 汇率邮件发送入口
 ==============================
 
 用法：
-    uv run fxmail              # 发送今日汇率邮件
-    uv run fxmail --date 20260930  # 发送指定日期汇率邮件
+    uv run fxmail              # 默认流程：SMB 流程（见下文「默认流程」）
+    uv run fxmail --date 20260930  # 默认流程，指定日期
+    uv run fxmail --mail        # 邮件流程：发送今日汇率邮件（原默认行为）
+    uv run fxmail --mail --date 20260930  # 邮件流程，指定日期
+    uv run fxmail --upload-smb 20261009  # 显式 SMB 流程（与默认流程一致）
     uv run fxmail --log-level DEBUG --log-dir ./logs  # 排障：输出调试日志
     uv run fxmail --sftp-tree          # 只列出 SFTP 根目录第一层后退出（不发邮件）
     uv run fxmail --sftp-tree 20261009 --sftp-depth 2
@@ -37,7 +40,22 @@ SFTP 上传（环境变量，可选）：
     BOC_CC  - 仅自定义汇率邮件（BOC_RECIEVER 那封）的抄送人
     未配置时不抄送；抄送地址与收件人相同时会自动去重，不会重复收到。
 
+SMB 上传（默认流程，可选）：
+    SMB_SERVER / SMB_SHARE / SMB_REMOTE_DIR / SMB_USERNAME / SMB_PASSWORD
+    默认流程会把当天已抓取的汇率 Excel（自定义汇率 + 交易所汇率）上传到
+    <SMB_REMOTE_DIR>/<YYYYMMDD>/ 下，远端已存在同大小同名文件时跳过，
+    不重复上传；当天还没抓取过时会先尝试抓取（银行 BOCHK 与交易所
+    HKEx 都抓）。未配置 SMB 时只在本地生成 Excel，不上传。
+
 流程：
+    默认流程（不带 --mail 时）即 SMB 流程：
+    1. 当天还没有生成过汇率 Excel 时，先尝试抓取——银行（BOCHK）和
+       交易所（HKEx）都要，在 temp/ 生成 自定义汇率/交易所汇率 xlsx；
+    2. 已配置 SMB 时把当天已抓取的汇率 Excel 上传到
+       <SMB_REMOTE_DIR>/<YYYYMMDD>/，远端已存在同大小同名文件时跳过，
+       不重复上传；
+    3. 未配置 SMB 时只在本地生成 Excel，不上传。
+    加 --mail 才走原邮件流程：
     1. 从 BOCHK / HKEx 网站获取汇率
     2. 按 TFISF Excel 公式计算自定义汇率
     3. 生成两个 Excel 附件（自定义汇率 + 交易所汇率）
@@ -84,6 +102,8 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 from log_setup import get_logger, log_file_path, setup_logging
 from ms_mail import send_mail
 from sc_infra import send_error
+from smb_upload import smb_enabled
+from smb_upload import upload_rate_file as upload_rate_file_to_smb
 from sftp_upload import (
     DEFAULT_TREE_DEPTH,
     list_tree,
@@ -766,6 +786,146 @@ def _upload_custom_to_sftp(date_str: str) -> int:
     return 0
 
 
+def _run_smb_mode(args: argparse.Namespace, date_str: str) -> int:
+    """SMB 流程（--upload-smb，也是 uv run fxmail 的默认流程）：
+
+    1. 当天还没有抓取过汇率 Excel 时，先尝试抓取——银行（BOCHK）和
+       交易所（HKEx）都要，在 temp/ 生成本地文件；
+    2. 已配置 SMB 时把当天已抓取的汇率 Excel（自定义汇率 + 交易所汇率）
+       上传到 <SMB_REMOTE_DIR>/<YYYYMMDD>/ 下，远端已存在同大小同名
+       文件时跳过，不重复上传；
+    3. 未配置 SMB 时只在本地生成 Excel，不上传。
+
+    Args:
+        args: 命令行参数命名空间（用 no_wechat / no_reuse）
+        date_str: 目标日期 YYYYMMDD
+
+    Returns:
+        进程退出码：0 成功，1 失败
+    """
+    yymmdd = date_str[2:]
+    custom_path = _TEMP_DIR / f"自定义汇率{yymmdd}.xlsx"
+    exchange_path = _TEMP_DIR / f"交易所汇率{yymmdd}.xlsx"
+
+    # 1. 当天还没抓全：先抓取（银行 + 交易所都要），失败则不继续上传
+    if not custom_path.exists() or not exchange_path.exists():
+        rc = _capture_rate_files(args, date_str)
+        if rc != 0:
+            return rc
+
+    local_files = [p for p in (custom_path, exchange_path) if p.exists()]
+    for missing in (custom_path, exchange_path):
+        if not missing.exists():
+            logger.warning(
+                "[FX] %s 未生成（如非交易日 HKEx 无数据属正常），跳过上传",
+                missing.name,
+            )
+    if not local_files:
+        logger.error(
+            "[FX] %s 当天没有可上传的汇率 Excel（%s）",
+            date_str, f"自定义汇率{yymmdd}.xlsx / 交易所汇率{yymmdd}.xlsx",
+        )
+        print(
+            f"错误: {date_str} 当天没有可上传的汇率 Excel", file=sys.stderr,
+        )
+        return 1
+
+    # 2. 未配置 SMB：文件已在本地就绪，不上传
+    if not smb_enabled():
+        logger.info(
+            "[FX] 未配置 SMB（SMB_SERVER / SMB_USERNAME），汇率 Excel "
+            "已就绪但不上传: %s",
+            ", ".join(p.name for p in local_files),
+        )
+        print(
+            "未配置 SMB，汇率 Excel 已就绪（未上传）: "
+            + ", ".join(p.name for p in local_files)
+        )
+        return 0
+
+    # 3. 已配置 SMB：逐个上传，远端已存在同大小文件时跳过
+    failed = False
+    for local_path in local_files:
+        try:
+            remote_path = upload_rate_file_to_smb(local_path, date_str)
+        except Exception as exc:
+            logger.error("[FX] 上传 %s 到 SMB 失败: %s", local_path.name, exc)
+            print(f"错误: 上传 {local_path.name} 到 SMB 失败: {exc}", file=sys.stderr)
+            failed = True
+            if not args.no_wechat:
+                try:
+                    send_error(
+                        f"【汇率导出异常 {date_str}】SMB 上传失败 "
+                        f"({local_path.name}): {exc}"
+                    )
+                except Exception as we:
+                    logger.error("[FX] 企业微信错误通知发送失败: %s", we)
+            continue
+        if remote_path is None:
+            logger.info(
+                "[FX] %s 远端已存在，未重复上传", local_path.name,
+            )
+            print(f"已跳过(远端已存在): {local_path.name}")
+        else:
+            logger.info(
+                "[FX] 已上传到 SMB: %s -> %s", local_path, remote_path,
+            )
+            print(f"已上传: {local_path} -> {remote_path}")
+    return 1 if failed else 0
+
+
+def _capture_rate_files(args: argparse.Namespace, date_str: str) -> int:
+    """尝试抓取当日汇率——银行（BOCHK）和交易所（HKEx）都抓，
+    在 temp/ 生成自定义汇率与交易所汇率两个 Excel。
+
+    Args:
+        args: 命令行参数命名空间（用 no_wechat / no_reuse）
+        date_str: 目标日期 YYYYMMDD
+
+    Returns:
+        进程退出码：0 成功，1 失败
+    """
+    logger.info(
+        "[FX] 尝试抓取当日汇率（银行 BOCHK + 交易所 HKEx），date=%s", date_str,
+    )
+    print("尝试抓取当日汇率（银行 + 交易所）...")
+    try:
+        result = process_rate_export(
+            date_str=date_str,
+            send_error_notify=not args.no_wechat,
+            include_hkex=True,
+            reuse_daily=not args.no_reuse,
+        )
+    except Exception as exc:
+        logger.error("[FX] 汇率抓取失败: %s\n%s", exc, traceback.format_exc())
+        print(f"错误: 汇率抓取失败: {exc}", file=sys.stderr)
+        if not args.no_wechat:
+            try:
+                send_error(
+                    f"【汇率导出异常 {date_str}】汇率抓取失败: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            except Exception as we:
+                logger.error("[FX] 企业微信错误通知发送失败: %s", we)
+        return 1
+
+    if result.get("errors"):
+        for e in result["errors"]:
+            logger.error("[FX] 汇率抓取错误: %s", e)
+        print("错误: 汇率抓取存在异常，详见日志", file=sys.stderr)
+        return 1
+
+    generated = [
+        str(p) for p in (result.get("custom_path"), result.get("exchange_path"))
+        if p
+    ]
+    logger.info(
+        "[FX] 汇率抓取完成，已生成: %s", ", ".join(generated) or "(无)",
+    )
+    print("已生成: " + ", ".join(generated) if generated else "未生成任何文件")
+    return 0
+
+
 def _send_error_report(
     recipients: list[str],
     errors: list[str],
@@ -852,6 +1012,20 @@ def main() -> None:
              "不抓取、不发邮件、不发企业微信",
     )
     parser.add_argument(
+        "--upload-smb",
+        metavar="YYYYMMDD",
+        help="SMB 流程（与不带参数的默认流程一致）：当天没抓取过则先尝试抓取"
+             "（银行 BOCHK + 交易所 HKEx）；已配置 SMB 时把汇率 Excel 上传到 "
+             "<SMB_REMOTE_DIR>/<YYYYMMDD>/，远端已存在同大小文件时跳过；"
+             "未配置 SMB 时只在本地生成 Excel",
+    )
+    parser.add_argument(
+        "--mail",
+        action="store_true",
+        help="走邮件流程（原有默认行为：抓汇率→生成 Excel→按收件人发邮件→"
+             "SFTP 上传）；不指定时默认走 SMB 流程",
+    )
+    parser.add_argument(
         "--sftp-depth",
         type=int,
         default=None,
@@ -885,6 +1059,17 @@ def main() -> None:
             sys.exit(1)
         sys.exit(_upload_custom_to_sftp(date_str))
 
+    # SMB 模式：已配置 SMB 则上传当日已抓取的汇率 Excel；未配置则改为抓取
+    if args.upload_smb:
+        date_str = args.upload_smb
+        try:
+            _date_display(date_str)
+        except ValueError:
+            logger.error("日期格式不正确 %s (应为 YYYYMMDD)", date_str)
+            print(f"错误: 日期格式不正确 {date_str} (应为 YYYYMMDD)", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(_run_smb_mode(args, date_str))
+
     date_str = args.date
     if date_str is None:
         date_str = dt.date.today().strftime("%Y%m%d")
@@ -894,6 +1079,14 @@ def main() -> None:
         logger.error("日期格式不正确 %s (应为 YYYYMMDD)", date_str)
         print(f"错误: 日期格式不正确 {date_str} (应为 YYYYMMDD)", file=sys.stderr)
         sys.exit(1)
+
+    # 默认流程：SMB 流程（当天没抓过就先抓银行+交易所，再按配置上传 SMB）
+    # 只有显式加 --mail 才走原来的邮件流程
+    if not args.mail:
+        logger.info(
+            "[FX] 未指定 --mail，执行默认 SMB 流程, date=%s", date_str,
+        )
+        sys.exit(_run_smb_mode(args, date_str))
 
     # 两种拼写都支持：FX_RECIEVER（历史拼写）/ FX_RECEIVER
     fx_recipients = _recipients("FX_RECIEVER", "FX_RECEIVER")

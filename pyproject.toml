@@ -12,6 +12,7 @@ dependencies = [
     "holidays>=0.30",
     "playwright>=1.63.0",
     "paramiko>=3.5",
+    "smbprotocol>=1.17.0",
 ]
 
 [project.scripts]
