@@ -3,11 +3,9 @@ main.py - FX 汇率邮件发送入口
 ==============================
 
 用法：
-    uv run fxmail              # 默认流程：SMB 流程（见下文「默认流程」）
+    uv run fxmail              # 默认流程：抓汇率→上传 SMB→按上传情况发邮件
     uv run fxmail --date 20260930  # 默认流程，指定日期
-    uv run fxmail --mail        # 邮件流程：发送今日汇率邮件（原默认行为）
-    uv run fxmail --mail --date 20260930  # 邮件流程，指定日期
-    uv run fxmail --upload-smb 20261009  # 显式 SMB 流程（与默认流程一致）
+    uv run fxmail --upload-smb 20261009  # 只上传 SMB，不发邮件
     uv run fxmail --log-level DEBUG --log-dir ./logs  # 排障：输出调试日志
     uv run fxmail --sftp-tree          # 只列出 SFTP 根目录第一层后退出（不发邮件）
     uv run fxmail --sftp-tree 20261009 --sftp-depth 2
@@ -17,13 +15,14 @@ main.py - FX 汇率邮件发送入口
     单文件 5MB 后轮转，保留 10 份）。可用 --log-level / --log-dir，
     或环境变量 LOG_LEVEL / LOG_DIR / LOG_FILE_PREFIX 调整。
 
-收件人（环境变量，至少配置其一，多个地址用 , 或 ; 分隔）：
+收件人（环境变量，可选；决定邮件发给谁，也决定抓取范围）：
     FX_RECIEVER / FX_RECEIVER  - 完整方案：自定义汇率 + 交易所汇率（含 HKEx 校验）
     BOC_RECIEVER / BOC_RECEIVER - 仅自定义汇率（只抓 BOCHK，不抓 HKEx，不校验交易所汇率）
     两种拼写均支持；多个邮箱可用逗号、分号或空格分隔，如
     FX_RECEIVER="a@xx.com;b@xx.com"。
-    两者都配置时，一次运行会给两边各发一封：FX_RECIEVER 收完整报告，
-    BOC_RECIEVER 只收自定义汇率部分。
+    两者都配置时，一次运行会给两边各发一封：FX_RECIEVER 收完整报告
+    （两个附件一封邮件），BOC_RECIEVER 只收自定义汇率部分。
+    都没配置时只上传 SMB、不发邮件（此时银行和交易所汇率都会抓）。
 
 SFTP 上传（环境变量，可选）：
     SFTP=host[:port] / SFTP_DIR / SFTP_USER / SFTP_PWD
@@ -42,40 +41,46 @@ SFTP 上传（环境变量，可选）：
 
 SMB 上传（默认流程，可选）：
     SMB_SERVER / SMB_SHARE / SMB_REMOTE_DIR / SMB_USERNAME / SMB_PASSWORD
-    默认流程会把当天已抓取的汇率 Excel（自定义汇率 + 交易所汇率）上传到
+    默认流程会把当天已抓取的汇率 Excel 上传到
     <SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/ 下，远端已存在同大小同名文件时跳过，
-    不重复上传；当天还没抓取过时会先尝试抓取（银行 BOCHK 与交易所
-    HKEx 都抓）。未配置 SMB 时只在本地生成 Excel，不上传。
+    不重复上传；当天还没抓取过时会先尝试抓取。未配置 SMB 时只在本地生成
+    Excel，不上传（此时所有本地文件按「未上传过」处理，照常发邮件）。
+    邮件闸门：只有本轮真正上传过的文件才会触发邮件——
+    检测到 BOC_RECIEVER 时自定义汇率上传后就发「仅自定义汇率」邮件，
+    已经上传过（本轮跳过）就不发；检测到 FX_RECIEVER 时两个文件都上传
+    （跳过已上传）后，把两个附件放一起发一封邮件。
 
-流程：
-    默认流程（不带 --mail 时）即 SMB 流程：
-    1. 当天还没有生成过汇率 Excel 时，先尝试抓取——银行（BOCHK）和
-       交易所（HKEx）都要，在 temp/ 生成 自定义汇率/交易所汇率 xlsx；
+流程（默认流程）：
+    1. 当天还没有生成过汇率 Excel 时，先尝试抓取——检测到 FX_RECIEVER
+       （或未配置任何收件人）时银行（BOCHK）和交易所（HKEx）都抓；只有
+       BOC_RECIEVER 时只抓银行，在 temp/ 生成本地 xlsx；
     2. 已配置 SMB 时把当天已抓取的汇率 Excel 上传到
-       <SMB_REMOTE_DIR>/<YYYYMMDD>/，远端已存在同大小同名文件时跳过，
+       <SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/，远端已存在同大小同名文件时跳过，
        不重复上传；
-    3. 未配置 SMB 时只在本地生成 Excel，不上传。
-    加 --mail 才走原邮件流程：
-    1. 从 BOCHK / HKEx 网站获取汇率
-    2. 按 TFISF Excel 公式计算自定义汇率
-    3. 生成两个 Excel 附件（自定义汇率 + 交易所汇率）
-    4. 构建邮件正文（含公式和计算结果）
-    5. 通过 MS Graph API 发送邮件到 FX_RECIEVER
+    3. 按「没有上传过的才发邮件」发邮件：
+       - BOC_RECIEVER：自定义汇率本轮新上传过才发「仅自定义汇率」邮件
+         （并发往 SFTP）；已经上传过就不发；
+       - FX_RECIEVER：自定义/交易所只要有一个本轮新上传过，就把两个附件
+         放一起发一封邮件；无交易所汇率时不发，避免误导；
+    4. 未配置 SMB 时只在本地生成 Excel，不上传，按原行为发邮件。
 
 当日复用：
     自定义汇率（含 自定义汇率yymmdd.xlsx 与 BOCHK 页面截图）以日期为维度
     缓存到输出目录（默认 ./temp/custom_snapshot_yyyymmdd.json）。
-    同一天第二次及之后的运行（如先给 BOC_RECIEVER 发过、再给 FX_RECIEVER
-    发）会直接复用当日的自定义汇率与截图，不再重新抓取 BOCHK；
-    只有当日尚无缓存时才真正抓取 BOCHK 并截图。
-    需要强制重新抓取时用 --no-reuse。HKEx 印花税率每次都会按当日重新抓取。
+    同一天第二次及之后的运行（如先上传过、再发邮件）会直接复用当日的
+    自定义汇率、交易所汇率与截图，不再抓取 BOCHK / HKEx，也不会重复
+    改写 Excel 文件（保证同日多次运行时文件字节稳定，「已上传」判断可靠）；
+    只有当日尚无缓存时才真正抓取并截图。
+    需要强制重新抓取时用 --no-reuse。
     当日截图会被保留到下一日运行的清理阶段，以便同日多次运行复用。
 
 异常策略：
     正常时只发汇率邮件，不发企业微信 webhook；
-    出现任何异常（网页打不开 / 汇率获取不到 / 汇率不是当日）时，
-    不发送汇率邮件（也不带汇率附件），只发送企业微信错误通知 +
-    一封【错误报告】邮件，并以退出码 1 结束。
+    出现 BOCHK 等关键数据异常（网页打不开 / 汇率获取不到 / 汇率不是当日）时，
+    不上传、不发汇率邮件，只发送企业微信错误通知 + 一封【错误报告】邮件
+    （发给 BOC_RECIEVER），并以退出码 1 结束；
+    HKEx 异常不影响自定义汇率的上传与 BOC 邮件，只是不给 FX_RECIEVER
+    发邮件，退出码仍为 1。
 
 发送机制：
     每次抓取后都会检查是否取到交易所汇率（HKEx 印花税率）。
@@ -787,7 +792,7 @@ def _upload_custom_to_sftp(date_str: str) -> int:
 
 
 def _run_smb_mode(args: argparse.Namespace, date_str: str) -> int:
-    """SMB 流程（--upload-smb，也是 uv run fxmail 的默认流程）：
+    """SMB 上传模式（--upload-smb）：只上传，不发邮件。
 
     1. 当天还没有抓取过汇率 Excel 时，先尝试抓取——银行（BOCHK）和
        交易所（HKEx）都要，在 temp/ 生成本地文件；
@@ -1014,16 +1019,10 @@ def main() -> None:
     parser.add_argument(
         "--upload-smb",
         metavar="YYYYMMDD",
-        help="SMB 流程（与不带参数的默认流程一致）：当天没抓取过则先尝试抓取"
-             "（银行 BOCHK + 交易所 HKEx）；已配置 SMB 时把汇率 Excel 上传到 "
+        help="只上传不发邮件：当天没抓取过则先尝试抓取（银行 BOCHK + 交易所 "
+             "HKEx）；已配置 SMB 时把汇率 Excel 上传到 "
              "<SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/，远端已存在同大小文件时跳过；"
              "未配置 SMB 时只在本地生成 Excel",
-    )
-    parser.add_argument(
-        "--mail",
-        action="store_true",
-        help="走邮件流程（原有默认行为：抓汇率→生成 Excel→按收件人发邮件→"
-             "SFTP 上传）；不指定时默认走 SMB 流程",
     )
     parser.add_argument(
         "--sftp-depth",
@@ -1036,7 +1035,6 @@ def main() -> None:
 
     # 按命令行参数重新初始化日志（模块导入时已用默认配置过一次）
     setup_logging(level=args.log_level, log_dir=args.log_dir, force=True)
-    started_at = dt.datetime.now()
     logger.info(
         "[FX] 命令行参数: date=%s, no_wechat=%s, no_reuse=%s, log_level=%s",
         args.date or "(今天)", args.no_wechat, args.no_reuse,
@@ -1080,19 +1078,44 @@ def main() -> None:
         print(f"错误: 日期格式不正确 {date_str} (应为 YYYYMMDD)", file=sys.stderr)
         sys.exit(1)
 
-    # 默认流程：SMB 流程（当天没抓过就先抓银行+交易所，再按配置上传 SMB）
-    # 只有显式加 --mail 才走原来的邮件流程
-    if not args.mail:
-        logger.info(
-            "[FX] 未指定 --mail，执行默认 SMB 流程, date=%s", date_str,
-        )
-        sys.exit(_run_smb_mode(args, date_str))
+    # 默认流程：SMB 流程（当天没抓过就先抓银行+交易所，再按配置上传 SMB，
+    # 并只对本次新上传的文件发邮件）
+    logger.info("[FX] 执行默认流程, date=%s", date_str)
+    sys.exit(_run_default_flow(args, date_str))
 
-    # 两种拼写都支持：FX_RECIEVER（历史拼写）/ FX_RECEIVER
+
+def _run_default_flow(args: argparse.Namespace, date_str: str) -> int:
+    """默认流程：抓汇率 → 生成 Excel → 上传 SMB（跳过已上传）→
+    只对本次新上传的文件发邮件。
+
+    规则：
+      - 当天没抓取过则先抓取：检测到 FX_RECIEVER（或未配置任何收件人）
+        时银行（BOCHK）和交易所（HKEx）都抓；只有 BOC_RECIEVER 时只抓
+        银行，上传自定义汇率一个文件；
+      - 已配置 SMB 时上传到 <SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/，远端
+        已存在同大小同名文件时跳过；
+      - BOC_RECIEVER：自定义汇率本次新上传过才发「仅自定义汇率」邮件
+        （并发往 SFTP，保持原行为）；
+      - FX_RECIEVER：自定义/交易所汇率只要有一个本次新上传过，就把两个
+        附件放一起发一封邮件；无交易所汇率时不发，避免误导；
+      - 未配置 SMB 时无从判断是否上传过，所有本地文件按「未上传过」
+        处理（保持原邮件行为）。
+
+    Args:
+        args: 命令行参数命名空间（用 no_wechat / no_reuse）
+        date_str: 目标日期 YYYYMMDD
+
+    Returns:
+        进程退出码：0 成功，1 失败
+    """
+    started_at = dt.datetime.now()
+
+    # 0. 先清理历史日期的截图（当日截图需保留供同日复用）
+    _cleanup_old_screenshots(date_str)
+
+    # 收件人（两种拼写都支持：RECIEVER 历史拼写 / RECEIVER）
     fx_recipients = _recipients("FX_RECIEVER", "FX_RECEIVER")
-    # BOC_RECIEVER 只接收自定义汇率（BOCHK），不依赖 HKEx 数据
     boc_recipients = _recipients("BOC_RECIEVER", "BOC_RECEIVER")
-    # 抄送人（可选）：FX_CC 对应完整汇率报告，BOC_CC 对应仅自定义汇率邮件
     fx_cc = _recipients("FX_CC")
     boc_cc = _recipients("BOC_CC")
     if not fx_recipients and fx_cc:
@@ -1105,84 +1128,17 @@ def main() -> None:
             "[FX] 配置了 BOC_CC 但没有 BOC_RECIEVER/BOC_RECEIVER，"
             "仅自定义汇率邮件不会发出，抄送 %s 不生效", ", ".join(boc_cc),
         )
-    if not fx_recipients and not boc_recipients:
-        logger.error(
-            "FX_RECIEVER / FX_RECEIVER / BOC_RECIEVER / BOC_RECEIVER "
-            "均未配置有效收件人，终止运行"
-        )
-        print(
-            "错误: FX_RECIEVER / FX_RECEIVER / BOC_RECIEVER / BOC_RECEIVER "
-            "均未配置有效收件人",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    # FX_RECIEVER 走完整方案（含 HKEx），只有它时才抓交易所汇率
-    include_hkex = bool(fx_recipients)
+    # FX_RECIEVER 需要交易所汇率；一个收件人都没配时两个都抓（纯上传场景）
+    include_hkex = bool(fx_recipients) or not (fx_recipients or boc_recipients)
 
     logger.info(
-        "===== FX Mail 开始, date=%s, mode=%s, reuse=%s =====",
+        "===== FX 开始, date=%s, mode=%s, reuse=%s =====",
         date_str,
         "完整汇率" if include_hkex else "仅自定义汇率(BOCHK)",
         "否(强制重抓)" if args.no_reuse else "是",
     )
 
-    try:
-        failed = _run(
-            args, date_str, fx_recipients, boc_recipients, include_hkex,
-            fx_cc, boc_cc,
-        )
-    except Exception:
-        logger.exception("[FX] 运行过程出现未捕获异常")
-        if not args.no_wechat:
-            try:
-                send_error(f"【汇率导出异常 {date_str}】运行过程出现未捕获异常")
-            except Exception as we:
-                logger.error("[FX] 企业微信错误通知发送失败: %s", we)
-        failed = True
-
-    elapsed = (dt.datetime.now() - started_at).total_seconds()
-    logger.info(
-        "[FX] 本次运行耗时 %.1fs, 日志文件: %s",
-        elapsed, log_file_path() or "(仅控制台)",
-    )
-    if failed:
-        logger.error("===== FX Mail 异常结束 =====")
-        sys.exit(1)
-
-    logger.info("===== FX Mail 完成 =====")
-
-
-def _run(
-    args: argparse.Namespace,
-    date_str: str,
-    fx_recipients: list[str],
-    boc_recipients: list[str],
-    include_hkex: bool,
-    fx_cc: list[str] | None = None,
-    boc_cc: list[str] | None = None,
-) -> bool:
-    """执行「抓汇率 → 生成 Excel → 发邮件」主流程。
-
-    Args:
-        args: 命令行参数命名空间
-        date_str: 目标日期 YYYYMMDD
-        fx_recipients: 完整汇率报告收件人（自定义 + 交易所）
-        boc_recipients: 仅自定义汇率收件人
-        include_hkex: 是否抓取 HKEx 印花税率
-        fx_cc: 完整汇率报告邮件的抄送人
-        boc_cc: 仅自定义汇率邮件的抄送人
-
-    Returns:
-        True 表示本次运行存在失败（调用方据此返回退出码 1）
-    """
-    # 0. 先清理历史日期的截图（当日截图需保留供同日复用）
-    _cleanup_old_screenshots(date_str)
-
-    # 1. 获取汇率并生成 Excel（异常不中断，统一收集为错误）
-    #    当日已有自定义汇率/截图时直接复用，不再抓取 BOCHK
-    result: dict | None = None
-    errors: list[str] = []
+    # 1. 获取汇率并生成 Excel（当日快照复用，不重复抓取/不重复改写文件）
     tb_text = ""
     try:
         result = process_rate_export(
@@ -1191,10 +1147,8 @@ def _run(
             include_hkex=include_hkex,
             reuse_daily=not args.no_reuse,
         )
-        errors = list(result.get("errors") or [])
     except Exception as exc:
         tb_text = traceback.format_exc()
-        errors = [f"汇率处理流程执行失败: {type(exc).__name__}: {exc}"]
         logger.error("[FX] 汇率处理失败:\n%s", tb_text)
         if not args.no_wechat:
             try:
@@ -1204,28 +1158,91 @@ def _run(
                 )
             except Exception as we:
                 logger.error("[FX] 企业微信错误通知发送失败: %s", we)
+        print(f"错误: 汇率处理失败: {exc}", file=sys.stderr)
+        return 1
 
-    failed = False
+    errors = list(result.get("errors") or [])
+    for idx, e in enumerate(errors, start=1):
+        logger.warning("[FX] 错误汇总 %d/%d: %s", idx, len(errors), e)
 
-    # 2. FX_RECIEVER: 原有方案 — 自定义汇率 + 交易所汇率（含 HKEx 校验）
-    #    没有交易所汇率时（周末 / 香港公众假期，HKEx 不发布当日汇率，
-    #    或 HKEx 数据为空），本次不给 FX_RECIEVER 发任何邮件，
-    #    避免发出缺少交易所汇率的报告造成误导。
-    if fx_recipients:
-        has_exchange = bool(result and result.get("exchange_rows"))
-        if errors:
-            # 有错误则记录失败并不发邮件；企业微信告警已在上面发出
-            failed = True
-            logger.error(
-                "[FX] 本次存在 %d 条错误，未发送邮件给 FX_RECIEVER: %s",
-                len(errors), ", ".join(fx_recipients),
+    # BOCHK 等关键数据异常：不上传、不发汇率邮件（BOC 错误报告保持原行为）
+    fatal_errors = [e for e in errors if not e.startswith("HKEx")]
+    if fatal_errors:
+        logger.error("[FX] 本次存在 %d 条数据异常，不上传、不发邮件", len(fatal_errors))
+        if boc_recipients:
+            _send_error_report(
+                boc_recipients, fatal_errors, date_str, tb_text, cc=boc_cc,
             )
-        elif not has_exchange:
+        print("错误: 汇率数据异常，未上传、未发邮件", file=sys.stderr)
+        return 1
+    # HKEx 异常不影响自定义汇率的上传与 BOC 邮件（与旧流程一致），
+    # 但没有交易所汇率时不给 FX_RECIEVER 发邮件
+    hkex_errors = [e for e in errors if e.startswith("HKEx")]
+    for e in hkex_errors:
+        logger.warning("[FX] HKEx 异常（不影响自定义汇率）: %s", e)
+
+    # 2. 上传 SMB，记录本次真正上传（而非跳过）的文件
+    custom_path: Path | None = result["custom_path"]
+    exchange_path: Path | None = result.get("exchange_path")
+    local_files = [p for p in (custom_path, exchange_path) if p]
+    newly_uploaded: set[str] = set()
+
+    if not smb_enabled():
+        # 未配置 SMB：无从判断是否上传过，按「未上传过」处理
+        newly_uploaded = {p.name for p in local_files}
+        logger.info(
+            "[FX] 未配置 SMB（SMB_SERVER / SMB_USERNAME），跳过上传；"
+            "汇率 Excel 已就绪: %s",
+            ", ".join(p.name for p in local_files) or "(无)",
+        )
+    else:
+        for local_path in local_files:
+            try:
+                remote_path = upload_rate_file_to_smb(local_path, date_str)
+            except Exception as exc:
+                logger.error("[FX] 上传 %s 到 SMB 失败: %s", local_path.name, exc)
+                print(
+                    f"错误: 上传 {local_path.name} 到 SMB 失败: {exc}",
+                    file=sys.stderr,
+                )
+                if not args.no_wechat:
+                    try:
+                        send_error(
+                            f"【汇率导出异常 {date_str}】SMB 上传失败 "
+                            f"({local_path.name}): {exc}"
+                        )
+                    except Exception as we:
+                        logger.error("[FX] 企业微信错误通知发送失败: %s", we)
+                return 1
+            if remote_path is None:
+                logger.info("[FX] %s 远端已存在，未重复上传", local_path.name)
+                print(f"已跳过(远端已存在): {local_path.name}")
+            else:
+                newly_uploaded.add(local_path.name)
+                logger.info(
+                    "[FX] 已上传到 SMB: %s -> %s", local_path, remote_path,
+                )
+                print(f"已上传: {local_path} -> {remote_path}")
+
+    # 3. 发邮件：只有本轮新上传过对应文件才发
+    failed = bool(hkex_errors)
+
+    if fx_recipients:
+        has_exchange = bool(result.get("exchange_rows"))
+        new_custom = bool(custom_path) and custom_path.name in newly_uploaded
+        new_exchange = bool(exchange_path) and exchange_path.name in newly_uploaded
+        if not has_exchange:
             # 无交易所汇率（周末/香港公众假期，HKEx 不发布当日汇率）
             logger.info(
                 "[FX] 本次无交易所汇率(date=%s)，不发邮件给 FX_RECIEVER: %s",
                 date_str, ", ".join(fx_recipients),
             )
+        elif not (new_custom or new_exchange):
+            logger.info(
+                "[FX] 自定义/交易所汇率本轮均已上传过，不发邮件给 FX_RECIEVER: %s",
+                ", ".join(fx_recipients),
+            )
+            print("自定义/交易所汇率本轮均已上传过，未发 FX 邮件")
         else:
             logger.info(
                 "[FX] 汇率数据就绪: 自定义 %d 行, 交易所 %d 行, 截图 %d 张",
@@ -1234,9 +1251,7 @@ def _run(
             )
             html_body = _build_email_html(result)
             subject = f"汇率报告 — {result['date_val'].strftime('%Y-%m-%d')}"
-            attachments = [
-                p for p in (result["custom_path"], result["exchange_path"]) if p
-            ]
+            attachments = [p for p in (custom_path, exchange_path) if p]
             attachments += [
                 s["path"] for s in (result.get("screenshots") or [])
             ]
@@ -1244,21 +1259,14 @@ def _run(
                 fx_recipients, subject, html_body, attachments, cc=fx_cc,
             )
 
-    # 3. BOC_RECIEVER: 只发自定义汇率 — HKEx 的异常不影响该邮件
     if boc_recipients:
-        boc_errors = [e for e in errors if not e.startswith("HKEx")]
-        if boc_errors:
-            _send_error_report(
-                boc_recipients, boc_errors, date_str, tb_text, cc=boc_cc,
-            )
-            failed = True
-        elif result is None:
-            # 汇率结果为空（如流程异常且错误都被归到 HKEx），不能发空邮件
-            failed = True
-            logger.error(
-                "[FX] 汇率结果为空，未发送邮件给 BOC_RECIEVER: %s",
+        new_custom = bool(custom_path) and custom_path.name in newly_uploaded
+        if not new_custom:
+            logger.info(
+                "[FX] 自定义汇率本轮已上传过，不发邮件给 BOC_RECIEVER: %s",
                 ", ".join(boc_recipients),
             )
+            print("自定义汇率本轮已上传过，未发 BOC 邮件")
         else:
             html_body = _build_email_html(
                 result, include_exchange=False, errors=[],
@@ -1267,9 +1275,7 @@ def _run(
                 f"汇率报告 — {result['date_val'].strftime('%Y-%m-%d')}"
                 f"（仅自定义汇率）"
             )
-            boc_attachments = (
-                [result["custom_path"]] if result["custom_path"] else []
-            )
+            boc_attachments = [custom_path] if custom_path else []
             boc_attachments += [
                 s["path"] for s in (result.get("screenshots") or [])
             ]
@@ -1277,14 +1283,21 @@ def _run(
                 boc_recipients, subject, html_body, boc_attachments, cc=boc_cc,
             )
             # BOC（仅自定义汇率）的 Excel 同步放到 SFTP 的 YYYYMMDD 目录下
-            _upload_boc_excel_to_sftp(result["custom_path"], date_str)
+            _upload_boc_excel_to_sftp(custom_path, date_str)
 
-    if errors:
-        logger.warning("[FX] 本次共收集到 %d 条错误", len(errors))
-        for idx, e in enumerate(errors, start=1):
-            logger.warning("[FX] 错误汇总 %d/%d: %s", idx, len(errors), e)
+    if not fx_recipients and not boc_recipients:
+        logger.info("[FX] 未配置收件人（FX/BOC_RECIEVER），本次仅上传不发邮件")
 
-    return failed
+    elapsed = (dt.datetime.now() - started_at).total_seconds()
+    logger.info(
+        "[FX] 本次运行耗时 %.1fs, 日志文件: %s",
+        elapsed, log_file_path() or "(仅控制台)",
+    )
+    if failed:
+        logger.error("===== FX 异常结束 =====")
+        return 1
+    logger.info("===== FX 完成 =====")
+    return 0
 
 
 if __name__ == "__main__":

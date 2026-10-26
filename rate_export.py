@@ -837,8 +837,14 @@ def _save_snapshot(
     bochk_usd_raw: dict,
     bochk_fx_raw: dict,
     bochk_update_times: dict[str, str],
+    exchange_rows: list[dict] | None = None,
+    hkex_data: dict | None = None,
 ) -> None:
-    """写入当日自定义汇率快照，供同日后续运行复用。
+    """写入当日汇率快照，供同日后续运行复用。
+
+    除自定义汇率（BOCHK）外，也保存交易所汇率（HKEx）与 HKEx 原始数据，
+    使同日第二次及以后的运行无需再抓 HKEx、也不会重复改写 Excel 文件
+    （文件字节保持稳定，SMB「不重复上传」的大小判断才可靠）。
 
     Args:
         snapshot_path: 快照文件路径
@@ -848,6 +854,8 @@ def _save_snapshot(
         bochk_usd_raw: 美元电汇牌价原始字典
         bochk_fx_raw: 港币现钞牌价原始字典
         bochk_update_times: 三个牌价页的资料更新时间
+        exchange_rows: 交易所汇率行列表，未抓取时为空
+        hkex_data: HKEx 原始数据字典（含 xls_url 等），未抓取时为空
     """
     payload = {
         "date_str": date_str,
@@ -857,6 +865,8 @@ def _save_snapshot(
         "bochk_usd_raw": bochk_usd_raw,
         "bochk_fx_raw": bochk_fx_raw,
         "bochk_update_times": bochk_update_times,
+        "exchange_rows": exchange_rows or [],
+        "hkex_data": hkex_data or {},
     }
     try:
         snapshot_path.write_text(
@@ -886,10 +896,11 @@ def process_rate_export(
 ) -> dict:
     """从 BOCHK 获取汇率并按 TFISF Excel 公式计算自定义汇率，生成 xlsx 文件。
 
-    当日已经跑过一次（例如先给 BOC_RECIEVER 发过自定义汇率）时，
-    默认直接复用当日快照中的自定义汇率与 BOCHK 截图，不再重新抓取
-    BOCHK；只有当日快照不存在时才真正抓取 BOCHK 页面。
-    HKEx 印花税率不受影响，每次都会按当日重新抓取。
+    当日已经跑过一次时，默认复用当日快照中的自定义汇率、交易所汇率与
+    BOCHK 截图：不再抓取 BOCHK，快照里已有交易所汇率时也不再抓取
+    HKEx、不重复改写 Excel 文件（文件字节保持稳定，SMB「不重复上传」
+    的大小判断才可靠）；只有当日快照不存在（或快照里没有交易所汇率）
+    时才真正抓取对应页面。
 
     Args:
         date_str: YYYYMMDD 格式日期，None 表示今天
@@ -900,8 +911,8 @@ def process_rate_export(
             默认 True（完整方案）；False 时只抓 BOCHK，只生成自定义汇率
         capture_screenshots: 是否截图 BOCHK 牌价页面作为邮件附件，
             默认 True；截图失败只记录警告，不影响主流程
-        reuse_daily: 是否复用当日已生成的自定义汇率与截图，
-            默认 True；False 则强制重新抓取 BOCHK 并重新截图
+        reuse_daily: 是否复用当日快照（自定义汇率、交易所汇率与截图），
+            默认 True；False 则强制重新抓取 BOCHK 与 HKEx 并重新生成文件
 
     Returns:
         包含以下键的字典：
@@ -958,6 +969,12 @@ def process_rate_export(
         bochk_usd_raw = snapshot.get("bochk_usd_raw") or {}
         bochk_fx_raw = snapshot.get("bochk_fx_raw") or {}
         bochk_update_times = snapshot.get("bochk_update_times") or {}
+        # 当日快照里的交易所汇率（可能为空：如当天首次以仅 BOCHK 模式跑过）
+        snapshot_exchange_rows = [
+            dict(r) for r in snapshot.get("exchange_rows") or []
+            if isinstance(r, dict)
+        ]
+        snapshot_hkex_data = snapshot.get("hkex_data") or {}
         logger.info(
             "[RE] 复用当日已有自定义汇率(date=%s, 快照 %s，生成于 %s)，"
             "跳过 BOCHK 抓取",
@@ -981,13 +998,25 @@ def process_rate_export(
         custom_rows_raw = _compute_custom_rows(
             bochk_hkd_raw, bochk_usd_raw, bochk_fx_raw,
         )
+        snapshot_exchange_rows = []
+        snapshot_hkex_data = {}
 
     hkex_data: dict = {}
     hkex_rows: list[dict] = []
     if include_hkex:
-        hkex_data = _collect_hkex_rates(date_str, errors)
-        hkex_rows = _hkex_to_rows(hkex_data)
-        logger.info("[RE] HKEx: %d 条汇率", len(hkex_rows))
+        if snapshot_exchange_rows:
+            # 当日快照里已有交易所汇率：直接复用，不重复抓取 HKEx，
+            # 也不重复改写 Excel（文件字节稳定，「不重复上传」才可靠）
+            hkex_rows = [dict(r) for r in snapshot_exchange_rows]
+            hkex_data = dict(snapshot_hkex_data)
+            logger.info(
+                "[RE] 复用当日快照中的交易所汇率(%d 条)，跳过 HKEx 抓取",
+                len(hkex_rows),
+            )
+        else:
+            hkex_data = _collect_hkex_rates(date_str, errors)
+            hkex_rows = _hkex_to_rows(hkex_data)
+            logger.info("[RE] HKEx: %d 条汇率", len(hkex_rows))
     else:
         logger.info("[RE] 仅 BOCHK 模式: 跳过 HKEx 印花税率抓取")
 
@@ -1019,21 +1048,41 @@ def process_rate_export(
             snapshot_path, date_str, custom_rows,
             bochk_hkd_raw, bochk_usd_raw, bochk_fx_raw,
             bochk_update_times,
+            exchange_rows=exchange_rows, hkex_data=hkex_data,
         )
 
     # 仅在有实际交易所汇率时生成交易所汇率.xlsx（非交易日/HKEx 无数据时
     # 不生成该文件，也不作为附件发送，避免误导）。
+    # 复用当日快照时保留已生成的文件不重写（字节稳定，避免同日重复上传）；
+    # 文件缺失或本次为全新抓取（含 --no-reuse）时才写。
     exchange_path = None
     if exchange_rows:
         exchange_path = out_dir / f"交易所汇率{yymmdd}.xlsx"
-        _write_xlsx(exchange_rows, exchange_path, date_val)
-        logger.info(
-            "[RE] 生成交易所汇率: %s (%d 行)", exchange_path, len(exchange_rows)
-        )
+        if not snapshot or not exchange_path.exists():
+            _write_xlsx(exchange_rows, exchange_path, date_val)
+            logger.info(
+                "[RE] 生成交易所汇率: %s (%d 行)", exchange_path, len(exchange_rows)
+            )
+        else:
+            logger.info(
+                "[RE] 复用交易所汇率文件: %s (%d 行)",
+                exchange_path, len(exchange_rows),
+            )
     else:
         logger.info(
             "[RE] 无交易所汇率数据(HKEx 无数据/非交易日), 不生成交易所汇率.xlsx"
         )
+
+    # 当日快照此前没有交易所汇率（如当天首次以仅 BOCHK 模式跑过），
+    # 本次抓到了就补存进快照，供同日后续运行复用
+    if snapshot and not snapshot_exchange_rows and exchange_rows:
+        _save_snapshot(
+            snapshot_path, date_str, custom_rows,
+            bochk_hkd_raw, bochk_usd_raw, bochk_fx_raw,
+            bochk_update_times,
+            exchange_rows=exchange_rows, hkex_data=hkex_data,
+        )
+        logger.info("[RE] 交易所汇率已补入当日快照: %s", snapshot_path.name)
 
     # BOCHK 页面截图（作为邮件附件，供人工核对当时页面数字）
     # 当日已截过的页面直接复用，只对缺失的补截图；截图失败只告警

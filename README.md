@@ -6,11 +6,10 @@
 ## 用法
 
 ```bash
-uv run fxmail                       # 默认流程：SMB 流程（见下文）
+uv run fxmail                       # 默认流程（见「默认流程」）
 uv run fxmail --date 20260930       # 默认流程，指定日期
-uv run fxmail --mail                # 邮件流程：发送今日汇率邮件（原默认行为）
-uv run fxmail --mail --date 20260930
-uv run fxmail --no-reuse            # 忽略当日缓存，强制重新抓取 BOCHK
+uv run fxmail --upload-smb 20260930 # 只上传 SMB，不发邮件
+uv run fxmail --no-reuse            # 忽略当日缓存，强制重新抓取 BOCHK / HKEx
 uv run fxmail --log-level DEBUG     # 排障：输出调试级别日志
 uv run fxmail --sftp-tree           # 只列出 SFTP 根目录第一层后退出（不发邮件）
 uv run fxmail --sftp-tree 20261009 --sftp-depth 2
@@ -47,15 +46,18 @@ uv run fxmail --sftp-tree /FX_Rates --sftp-depth 2   # 需要更深层时显式�
 默认层级由 `sftp_upload.DEFAULT_TREE_DEPTH` 决定（当前 4），需要更深/更浅时用 `--sftp-depth N` 覆盖。
 `--sftp-tree` 只连 SFTP 打印目录后即退出，不抓汇率也不发邮件；文件名后附带大小与修改时间。
 
-## SMB 流程（默认流程）
+## 默认流程（uv run fxmail）
 
-`uv run fxmail` 不带 `--mail` 时默认执行本流程（`--upload-smb YYYYMMDD` 与它完全一致，只是显式指定日期）：
+`uv run fxmail` 不带参数时执行（`--upload-smb YYYYMMDD` 是它的「只上传、不发邮件」版本）：
 
-1. **当天还没抓取过**（`temp/` 里没有当天两个 Excel）：先尝试抓取——**银行（BOCHK）和交易所（HKEx）都抓**，在 `temp/` 生成 `自定义汇率<yymmdd>.xlsx` 与 `交易所汇率<yymmdd>.xlsx`；
+1. **当天还没抓取过**（`temp/` 里没有当天 Excel）：先尝试抓取——检测到 `FX_RECIEVER`（或未配置任何收件人）时**银行（BOCHK）和交易所（HKEx）都抓**；只有 `BOC_RECIEVER` 时只抓银行，在 `temp/` 生成对应 xlsx；
 2. **已配置 SMB**：把当天已抓取的汇率 Excel 上传到 `<SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/`，**远端已存在同大小同名文件时跳过，不重复上传**；大小不一致才重新上传；
-3. **未配置 SMB**：只在本地生成 Excel，不上传。
+3. **按「没有上传过的才发邮件」发邮件**：
+   - 检测到 `BOC_RECIEVER`：自定义汇率**上传后就发**「仅自定义汇率」邮件（并发往 SFTP）；**已经上传过（本轮跳过）就不发**；
+   - 检测到 `FX_RECIEVER`：两个文件都上传（跳过已上传）后，**两个附件放一起发一封邮件**；无交易所汇率时不发，避免误导；
+4. **未配置 SMB**：只在本地生成 Excel，不上传；此时所有本地文件按「未上传过」处理，照常发邮件。
 
-任一文件上传失败都会记日志、发企业微信通知并以退出码 1 结束，不做静默兜底。
+任一文件上传失败都会记日志、发企业微信通知并以退出码 1 结束，不做静默兜底；BOCHK 等关键数据异常时不上传、不发汇率邮件（给 `BOC_RECIEVER` 发错误报告），退出码 1。
 
 | 环境变量 | 说明 |
 | --- | --- |
@@ -67,7 +69,7 @@ uv run fxmail --sftp-tree /FX_Rates --sftp-depth 2   # 需要更深层时显式�
 
 远端布局为 `<SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/<文件名>`，例如 `FX_Rates/2026/20261009/自定义汇率261009.xlsx`（目录不存在会自动创建）。
 
-邮件流程（抓取 → 生成 Excel → 按收件人发邮件 → SFTP 上传）改用 `--mail` 触发，行为与之前一致。
+同日复用：自定义汇率、交易所汇率与截图都进当日快照（`temp/custom_snapshot_yyyymmdd.json`），同日第二次及以后的运行不重复抓取、不重复改写 Excel（文件字节稳定，「已上传」判断才可靠）。
 
 ## 日志
 
