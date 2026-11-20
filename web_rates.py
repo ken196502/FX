@@ -15,6 +15,10 @@ web_rates.py - 从网站抓取银行汇率和交易所印花税率
   3. BOCHK 中銀香港「各類貨幣兌港元現鈔牌價」
      https://www.bochk.com/tc/investment/rates/fxrates.html
      — iframe 加载，含各币种兑港元的现钞买入/卖出价。
+
+  4. BOCHK 中銀香港「港元最優惠利率」
+     https://www.bochk.com/en/investment/rates/hkprime.html
+     — iframe 加载，含港元最优惠利率（如 5.00000%）与资料更新时间。
 """
 
 from __future__ import annotations
@@ -67,6 +71,11 @@ BOCHK_USDRATES_IFRAME = (
 BOCHK_HKDRATES_PAGE = "https://www.bochk.com/tc/investment/rates/hkdrates.html"
 BOCHK_USDRATES_PAGE = "https://www.bochk.com/tc/investment/rates/usdrates.html"
 BOCHK_FXRATES_PAGE = "https://www.bochk.com/tc/investment/rates/fxrates.html"
+BOCHK_HKPRIME_PAGE = "https://www.bochk.com/en/investment/rates/hkprime.html"
+BOCHK_HKPRIME_IFRAME = (
+    "https://www.bochk.com/whk/rates/hkDollarPrimeRate/"
+    "hkDollarPrimeRate-enquiry.action?lang=en"
+)
 
 
 def _http_get(url: str, headers: dict | None = None, timeout: int = _TIMEOUT):
@@ -313,6 +322,74 @@ def fetch_bochk_usdrates() -> dict:
         len(rates), update_time or "(未获取到)",
     )
     return {"rates": rates, "update_time": update_time}
+
+
+# 港元最优惠利率 iframe 页面结构：
+#   <tr class="best-rate">
+#     <td>中銀香港的港元最優惠利率：</td>
+#     <td>5.00000<span>%</span></td>
+#   </tr>
+#   資料更新於香港時間： 2026/11/20 14:00:02
+_PRIME_RATE_BLOCK_RE = re.compile(
+    r'<tr[^>]*class="[^"]*best-rate[^"]*"[^>]*>(.*?)</tr>',
+    re.DOTALL | re.IGNORECASE,
+)
+_PRIME_RATE_VALUE_RE = re.compile(
+    r'(\d+(?:\.\d+)?)\s*<span[^>]*>\s*%\s*</span>',
+    re.IGNORECASE,
+)
+_PRIME_UPDATE_RE = re.compile(
+    r'(?:資料更新於香港時間|Information last updated at HK Time)'
+    r'\s*[：:]\s*([\d/\s:]+)',
+    re.IGNORECASE,
+)
+
+
+def fetch_bochk_prime_rate() -> dict:
+    """抓取 BOCHK「港元最優惠利率」页面，返回利率百分比与资料更新时间。
+
+    页面数据位于 iframe 中，iframe HTML 由父页面 hkprime.html 加载。
+
+    Returns:
+        字典含 rate_percent (float, 如 5.0 代表 5%) 与 update_time
+
+    Raises:
+        RuntimeError: 页面结构变化导致利率值无法解析，或利率数值异常
+    """
+    logger.info("[BOCHK-PRIME] 抓取港元最优惠利率")
+    html = _fetch_bochk_iframe(
+        BOCHK_HKPRIME_IFRAME,
+        referer=BOCHK_HKPRIME_PAGE,
+    )
+    block = _PRIME_RATE_BLOCK_RE.search(html)
+    if not block:
+        raise RuntimeError(
+            "BOCHK 港元最优惠利率: 页面未找到 best-rate 行（页面结构可能已变化）"
+        )
+    value = _PRIME_RATE_VALUE_RE.search(block.group(1))
+    if not value:
+        raise RuntimeError(
+            "BOCHK 港元最优惠利率: best-rate 行中未找到百分比数值: "
+            + _clean_html_text(block.group(1))[:200]
+        )
+    rate_percent = float(value.group(1))
+    if rate_percent <= 0:
+        raise RuntimeError(
+            f"BOCHK 港元最优惠利率: 利率数值异常 ({rate_percent})"
+        )
+
+    update_time = ""
+    upd = _PRIME_UPDATE_RE.search(html)
+    if upd:
+        update_time = _clean_html_text(upd.group(1)).strip()
+    else:
+        logger.warning("[BOCHK-PRIME] 未匹配到资料更新时间（不影响利率取值）")
+
+    logger.info(
+        "[BOCHK-PRIME] 抓取完成: %.5f%%, 资料更新时间=%s",
+        rate_percent, update_time or "(未获取到)",
+    )
+    return {"rate_percent": rate_percent, "update_time": update_time}
 
 
 def _fetch_bochk_iframe(url: str, referer: str = "") -> str:

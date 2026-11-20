@@ -20,6 +20,7 @@ sftp_upload.py - 通过 SFTP 上传汇率 Excel
 
 未配置 SFTP 相关变量时上传会直接跳过（不抛异常），避免影响主流程；
 已配置但连接/上传失败时抛出 RuntimeError，由调用方决定如何处理。
+远端已存在同名文件时默认跳过（返回 None），传 force=True 才覆盖。
 
 另外提供 list_tree()，可递归列出 SFTP 上的目录树（供 --sftp-tree 使用）。
 """
@@ -154,15 +155,16 @@ def _open_sftp() -> tuple:
     return client, sftp
 
 
-def upload_file(local_path: Path, remote_path: str) -> str:
+def upload_file(local_path: Path, remote_path: str, force: bool = False) -> str | None:
     """把本地文件上传到 SFTP 指定路径（自动创建远端目录）。
 
     Args:
         local_path: 本地文件路径
         remote_path: 远端完整路径（含文件名），目录不存在时自动创建
+        force: True 时覆盖远端同名文件；默认已存在则跳过
 
     Returns:
-        实际写入的远端路径
+        实际写入的远端路径；远端已存在且未 force 时返回 None
 
     Raises:
         RuntimeError: SFTP 未配置、连接失败或上传失败
@@ -177,9 +179,9 @@ def upload_file(local_path: Path, remote_path: str) -> str:
     remote_path = remote_path.replace("\\", "/")
 
     logger.info(
-        "[SFTP] 上传 %s -> %s@%s:%d:%s (%.0f KB)",
+        "[SFTP] 检查上传 %s -> %s@%s:%d:%s (%.0f KB, force=%s)",
         local_path.name, user, host, port, remote_path,
-        local_path.stat().st_size / 1024,
+        local_path.stat().st_size / 1024, force,
     )
 
     client, sftp = _open_sftp()
@@ -187,6 +189,21 @@ def upload_file(local_path: Path, remote_path: str) -> str:
         remote_dir = posixpath.dirname(remote_path)
         if remote_dir:
             _ensure_remote_dir(sftp, remote_dir)
+        if not force:
+            try:
+                remote_attr = sftp.stat(remote_path)
+            except OSError:
+                remote_attr = None
+            if remote_attr is not None:
+                if (
+                    remote_attr.st_mode is not None
+                    and not stat.S_ISREG(remote_attr.st_mode)
+                ):
+                    raise RuntimeError(
+                        f"SFTP 远端路径已存在且不是文件: {remote_path}"
+                    )
+                logger.info("[SFTP] 远端已存在，跳过: %s", remote_path)
+                return None
         sftp.put(str(local_path), remote_path)
         try:
             size = sftp.stat(remote_path).st_size
@@ -215,7 +232,8 @@ def upload_rate_file(
     file_path: Path,
     date_str: str,
     remote_base: str | None = None,
-) -> str:
+    force: bool = False,
+) -> str | None:
     """把汇率 Excel 上传到 SFTP 的 <根目录>/<YYYYMMDD>/ 下。
 
     Args:
@@ -223,9 +241,10 @@ def upload_rate_file(
         date_str: 目标日期 YYYYMMDD，用作 SFTP 上的子目录名
         remote_base: SFTP 根目录，None 时取环境变量 SFTP_DIR（默认空，
             表示上传到登录后的默认目录）
+        force: True 时覆盖远端同名文件；默认已存在则跳过
 
     Returns:
-        实际写入的远端完整路径
+        实际写入的远端完整路径；远端已存在且未 force 时返回 None
 
     Raises:
         RuntimeError: SFTP 未配置、连接失败或上传失败
@@ -234,7 +253,7 @@ def upload_rate_file(
     base = (remote_base if remote_base is not None else _env("SFTP_DIR")).strip()
     base = base.replace("\\", "/").strip("/")
     remote_path = "/".join(p for p in (base, date_str, Path(file_path).name) if p)
-    return upload_file(file_path, remote_path)
+    return upload_file(file_path, remote_path, force=force)
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,8 @@ rate_export.py - 汇率整合导出
 
   1. 自定义汇率yymmdd.xlsx — 来源: BOCHK 港币电汇牌价（按公式计算）
   2. 交易所汇率yymmdd.xlsx — 来源: 仅 HKEx 印花税率
+  3. base_rateyymmdd.xlsx — 来源: BOCHK 港元最优惠利率页面
+     （saving_rate 固定 0，prime_rate 为页面利率的小数值，vaild_date 为当日）
 
 自定义汇率计算公式（参照 TFISF Excel）：
   F = Bid  = BOCHK 客户卖出价 (银行买入价)
@@ -44,6 +46,7 @@ from sc_infra import send_error
 from web_rates import (
     fetch_bochk_fxrates,
     fetch_bochk_hkdrates,
+    fetch_bochk_prime_rate,
     fetch_bochk_usdrates,
     fetch_hkex_stampfx,
 )
@@ -193,6 +196,24 @@ HKEX_CURRENCY_MAP: dict[str, str] = {
     "Renminbi": "CNY",
     "U.S. dollars": "USD",
 }
+
+# 港元最优惠利率导入表（base_rate<yymmdd>.xlsx）
+# 字段名沿用业务模板拼写（vaild_date）
+BASE_RATE_HEADERS: list[str] = [
+    "base_rate_code",
+    "base_rate_name",
+    "money_type",
+    "saving_rate",
+    "prime_rate",
+    "day_year",
+    "vaild_date",
+    "remark",
+]
+BASE_RATE_CODE = 0
+BASE_RATE_NAME = "HKD 5"
+BASE_RATE_MONEY_TYPE = "HKD"
+BASE_RATE_SAVING_RATE = 0
+BASE_RATE_DAY_YEAR = 365
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +439,20 @@ def _collect_hkex_rates(date_str: str, errors: list[str]) -> dict:
     if not data.get("rates"):
         errors.append(f"HKEx: 印花税率数据为空 (日期 {date_str})")
     return data
+
+
+def _collect_bochk_prime_rate(errors: list[str]) -> dict:
+    """从 BOCHK 港元最优惠利率页面抓取利率。
+
+    页面解析/请求失败时记录错误并返回空字典，由调用方决定是否继续。
+
+    Args:
+        errors: 错误信息收集列表
+
+    Returns:
+        含 rate_percent / update_time 的字典，失败时为空
+    """
+    return _fetch_safe("BOCHK 港元最优惠利率", errors, fetch_bochk_prime_rate)
 
 
 # ---------------------------------------------------------------------------
@@ -762,6 +797,61 @@ def _write_xlsx(
     wb.save(str(output_path))
 
 
+def _write_base_rate_xlsx(
+    prime_data: dict,
+    date_str: str,
+    output_path: Path,
+) -> None:
+    """生成港元最优惠利率导入表 base_rate<yymmdd>.xlsx。
+
+    saving_rate 固定为 0（不取抓取值）；prime_rate 取页面利率的百分数，
+    除以 100 换成小数（5.00000% -> 0.05）；vaild_date 用目标日期。
+
+    Args:
+        prime_data: fetch_bochk_prime_rate 的返回字典
+        date_str: 目标日期 YYYYMMDD
+        output_path: 输出文件路径
+
+    Raises:
+        RuntimeError: 未取到有效利率或日期格式不对
+    """
+    rate_percent = _to_float(prime_data.get("rate_percent"))
+    if rate_percent <= 0:
+        raise RuntimeError(
+            f"港元最优惠利率数据无效 (rate_percent={prime_data.get('rate_percent')!r})"
+        )
+    try:
+        valid_date = int(date_str)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(f"日期格式不正确 (应为 YYYYMMDD): {date_str}") from exc
+    rate_decimal = round(rate_percent / 100.0, 8)
+
+    row = [
+        BASE_RATE_CODE,
+        BASE_RATE_NAME,
+        BASE_RATE_MONEY_TYPE,
+        BASE_RATE_SAVING_RATE,
+        rate_decimal,
+        BASE_RATE_DAY_YEAR,
+        valid_date,
+        "",
+    ]
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "base_rate"
+    for col_idx, header in enumerate(BASE_RATE_HEADERS, start=1):
+        ws.cell(row=1, column=col_idx, value=header)
+    for col_idx, value in enumerate(row, start=1):
+        ws.cell(row=2, column=col_idx, value=value)
+
+    for col_idx, header in enumerate(BASE_RATE_HEADERS, start=1):
+        max_len = max(len(header), len(str(row[col_idx - 1])))
+        ws.column_dimensions[get_column_letter(col_idx)].width = max_len + 4
+
+    wb.save(str(output_path))
+
+
 # ---------------------------------------------------------------------------
 # 日期解析
 # ---------------------------------------------------------------------------
@@ -839,12 +929,14 @@ def _save_snapshot(
     bochk_update_times: dict[str, str],
     exchange_rows: list[dict] | None = None,
     hkex_data: dict | None = None,
+    prime_rate_data: dict | None = None,
 ) -> None:
     """写入当日汇率快照，供同日后续运行复用。
 
-    除自定义汇率（BOCHK）外，也保存交易所汇率（HKEx）与 HKEx 原始数据，
-    使同日第二次及以后的运行无需再抓 HKEx、也不会重复改写 Excel 文件
-    （文件字节保持稳定，SMB「不重复上传」的大小判断才可靠）。
+    除自定义汇率（BOCHK）外，也保存交易所汇率（HKEx）、HKEx 原始数据
+    与港元最优惠利率，使同日第二次及以后的运行无需再抓这些页面、
+    也不会重复改写 Excel 文件（文件字节保持稳定，SMB「不重复上传」的
+    大小判断才可靠）。
 
     Args:
         snapshot_path: 快照文件路径
@@ -856,6 +948,7 @@ def _save_snapshot(
         bochk_update_times: 三个牌价页的资料更新时间
         exchange_rows: 交易所汇率行列表，未抓取时为空
         hkex_data: HKEx 原始数据字典（含 xls_url 等），未抓取时为空
+        prime_rate_data: 港元最优惠利率字典，未抓取时为空
     """
     payload = {
         "date_str": date_str,
@@ -867,6 +960,7 @@ def _save_snapshot(
         "bochk_update_times": bochk_update_times,
         "exchange_rows": exchange_rows or [],
         "hkex_data": hkex_data or {},
+        "prime_rate_data": prime_rate_data or {},
     }
     try:
         snapshot_path.write_text(
@@ -896,11 +990,11 @@ def process_rate_export(
 ) -> dict:
     """从 BOCHK 获取汇率并按 TFISF Excel 公式计算自定义汇率，生成 xlsx 文件。
 
-    当日已经跑过一次时，默认复用当日快照中的自定义汇率、交易所汇率与
-    BOCHK 截图：不再抓取 BOCHK，快照里已有交易所汇率时也不再抓取
-    HKEx、不重复改写 Excel 文件（文件字节保持稳定，SMB「不重复上传」
-    的大小判断才可靠）；只有当日快照不存在（或快照里没有交易所汇率）
-    时才真正抓取对应页面。
+    当日已经跑过一次时，默认复用当日快照中的自定义汇率、交易所汇率、
+    港元最优惠利率与 BOCHK 截图：不再抓取 BOCHK，快照里已有交易所汇率
+    时也不再抓取 HKEx、不重复改写 Excel 文件（文件字节保持稳定，
+    SMB「不重复上传」的大小判断才可靠）；只有当日快照不存在（或快照里
+    没有对应数据）时才真正抓取对应页面。
 
     Args:
         date_str: YYYYMMDD 格式日期，None 表示今天
@@ -909,10 +1003,12 @@ def process_rate_export(
         send_error_notify: 出错时是否发送企业微信通知，默认 True
         include_hkex: 是否抓取 HKEx 印花税率并生成交易所汇率.xlsx，
             默认 True（完整方案）；False 时只抓 BOCHK，只生成自定义汇率
+            （港元最优惠利率表始终随 BOCHK 一起抓取）
         capture_screenshots: 是否截图 BOCHK 牌价页面作为邮件附件，
             默认 True；截图失败只记录警告，不影响主流程
-        reuse_daily: 是否复用当日快照（自定义汇率、交易所汇率与截图），
-            默认 True；False 则强制重新抓取 BOCHK 与 HKEx 并重新生成文件
+        reuse_daily: 是否复用当日快照（自定义汇率、交易所汇率、
+            港元最优惠利率与截图），默认 True；False 则强制重新抓取
+            BOCHK / HKEx / 港元最优惠利率并重新生成文件
 
     Returns:
         包含以下键的字典：
@@ -920,6 +1016,7 @@ def process_rate_export(
           - date_val: dt.date 日期对象
           - custom_path: 自定义汇率 xlsx 文件路径
           - exchange_path: 交易所汇率 xlsx 文件路径
+          - base_rate_path: 港元最优惠利率 xlsx 文件路径
           - custom_rows: 自定义汇率行列表
           - exchange_rows: 交易所汇率行列表
           - bochk_hkd_raw: BOCHK 港币原始汇率字典
@@ -975,6 +1072,10 @@ def process_rate_export(
             if isinstance(r, dict)
         ]
         snapshot_hkex_data = snapshot.get("hkex_data") or {}
+        prime_rate_data = snapshot.get("prime_rate_data") or {}
+        prime_fetched = bool(prime_rate_data)
+        if prime_fetched:
+            logger.info("[RE] 复用当日快照中的港元最优惠利率，跳过页面抓取")
         logger.info(
             "[RE] 复用当日已有自定义汇率(date=%s, 快照 %s，生成于 %s)，"
             "跳过 BOCHK 抓取",
@@ -1000,6 +1101,14 @@ def process_rate_export(
         )
         snapshot_exchange_rows = []
         snapshot_hkex_data = {}
+        prime_rate_data = _collect_bochk_prime_rate(errors)
+        prime_fetched = True
+
+    # 当日快照是旧版本（没有港元最优惠利率）时补抓一次，
+    # 保证补跑同样能生成 base_rate 文件
+    if not prime_fetched:
+        prime_rate_data = _collect_bochk_prime_rate(errors)
+        prime_fetched = True
 
     hkex_data: dict = {}
     hkex_rows: list[dict] = []
@@ -1043,12 +1152,27 @@ def process_rate_export(
         _write_xlsx(custom_rows, custom_path, date_val)
         logger.info("[RE] 生成自定义汇率: %s (%d 行)", custom_path, len(custom_rows))
 
+    # 港元最优惠利率导入表：利率值可来自当日快照，但文件每次重写，
+    # 这样改了固定字段（如 saving_rate）后同日补跑也能立刻生效。
+    # 该文件不走 SMB「同大小跳过」逻辑，无需保持字节稳定。
+    base_rate_path: Path | None = None
+    if prime_rate_data:
+        base_rate_path = out_dir / f"base_rate{yymmdd}.xlsx"
+        _write_base_rate_xlsx(prime_rate_data, date_str, base_rate_path)
+        logger.info(
+            "[RE] 生成港元最优惠利率: %s (%.5f%%)",
+            base_rate_path, prime_rate_data["rate_percent"],
+        )
+    else:
+        logger.warning("[RE] 未获取到港元最优惠利率，不生成 base_rate 文件")
+
     if not snapshot:
         _save_snapshot(
             snapshot_path, date_str, custom_rows,
             bochk_hkd_raw, bochk_usd_raw, bochk_fx_raw,
             bochk_update_times,
             exchange_rows=exchange_rows, hkex_data=hkex_data,
+            prime_rate_data=prime_rate_data,
         )
 
     # 仅在有实际交易所汇率时生成交易所汇率.xlsx（非交易日/HKEx 无数据时
@@ -1073,16 +1197,20 @@ def process_rate_export(
             "[RE] 无交易所汇率数据(HKEx 无数据/非交易日), 不生成交易所汇率.xlsx"
         )
 
-    # 当日快照此前没有交易所汇率（如当天首次以仅 BOCHK 模式跑过），
-    # 本次抓到了就补存进快照，供同日后续运行复用
-    if snapshot and not snapshot_exchange_rows and exchange_rows:
+    # 当日快照此前没有交易所汇率（如当天首次以仅 BOCHK 模式跑过）
+    # 或没有港元最优惠利率（旧版快照）时，本次抓到了就补存进快照
+    if snapshot and (
+        (not snapshot_exchange_rows and exchange_rows)
+        or not (snapshot.get("prime_rate_data") or {})
+    ):
         _save_snapshot(
             snapshot_path, date_str, custom_rows,
             bochk_hkd_raw, bochk_usd_raw, bochk_fx_raw,
             bochk_update_times,
             exchange_rows=exchange_rows, hkex_data=hkex_data,
+            prime_rate_data=prime_rate_data,
         )
-        logger.info("[RE] 交易所汇率已补入当日快照: %s", snapshot_path.name)
+        logger.info("[RE] 新增数据已补入当日快照: %s", snapshot_path.name)
 
     # BOCHK 页面截图（作为邮件附件，供人工核对当时页面数字）
     # 当日已截过的页面直接复用，只对缺失的补截图；截图失败只告警
@@ -1116,8 +1244,11 @@ def process_rate_export(
     else:
         logger.info("[RE] 汇率整合导出完成，本次无数据异常")
     logger.info(
-        "[RE] 汇总: 自定义 %d 行, 交易所 %d 行, 截图 %d 张, 耗时 %.1fs",
-        len(custom_rows), len(exchange_rows), len(screenshots), elapsed,
+        "[RE] 汇总: 自定义 %d 行, 交易所 %d 行, 最优惠利率 %s, "
+        "截图 %d 张, 耗时 %.1fs",
+        len(custom_rows), len(exchange_rows),
+        f"{prime_rate_data['rate_percent']:.5f}%" if prime_rate_data else "无",
+        len(screenshots), elapsed,
     )
 
     return {
@@ -1125,6 +1256,7 @@ def process_rate_export(
         "date_val": date_val,
         "custom_path": custom_path,
         "exchange_path": exchange_path,
+        "base_rate_path": base_rate_path,
         "custom_rows": custom_rows,
         "exchange_rows": exchange_rows,
         "bochk_hkd_raw": bochk_hkd_raw,
@@ -1132,6 +1264,7 @@ def process_rate_export(
         "bochk_fx_raw": bochk_fx_raw,
         "bochk_update_times": bochk_update_times,
         "hkex_data": hkex_data,
+        "prime_rate_data": prime_rate_data,
         "screenshots": screenshots,
         "errors": errors,
     }

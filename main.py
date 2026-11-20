@@ -9,6 +9,8 @@ main.py - FX 汇率邮件发送入口
     uv run fxmail --log-level DEBUG --log-dir ./logs  # 排障：输出调试日志
     uv run fxmail --sftp-tree          # 只列出 SFTP 根目录第一层后退出（不发邮件）
     uv run fxmail --sftp-tree 20261009 --sftp-depth 2
+    uv run fxmail --upload-sftp 20261009 --force  # 强制覆盖 SFTP 所有同名文件
+    uv run fxmail --date 20261009 --force-base-rate  # 只覆盖 SFTP 上的 base_rate
 
 日志：
     运行日志同时写入控制台和文件（默认 ./logs/fx_YYYYMMDD.log，
@@ -28,6 +30,10 @@ SFTP 上传（环境变量，可选）：
     SFTP=host[:port] / SFTP_DIR / SFTP_USER / SFTP_PWD
     给 BOC_RECIEVER 发出「仅自定义汇率」邮件后，会把该 Excel 同步上传到
     <SFTP_DIR>/<YYYYMMDD>/ 下（目录不存在自动创建）。
+    港元最优惠利率表 base_rate<yymmdd>.xlsx 每次默认流程都会同步到同一
+    日期目录，不受邮件收件人配置影响。
+    远端已存在同名文件时默认跳过；--force 覆盖所有 SFTP 同名文件，
+    --force-base-rate 只覆盖 base_rate（不影响自定义汇率）。
     未配置 SFTP / SFTP_USER 时跳过；上传失败只记日志并发企业微信通知，
     不影响已发出的邮件。
     用 --sftp-tree [PATH] 可只列出 SFTP 目录后退出（不发邮件）：
@@ -53,7 +59,8 @@ SMB 上传（默认流程，可选）：
 流程（默认流程）：
     1. 当天还没有生成过汇率 Excel 时，先尝试抓取——检测到 FX_RECIEVER
        （或未配置任何收件人）时银行（BOCHK）和交易所（HKEx）都抓；只有
-       BOC_RECIEVER 时只抓银行，在 temp/ 生成本地 xlsx；
+       BOC_RECIEVER 时只抓银行；无论哪种模式都同时抓港元最优惠利率页面，
+       在 temp/ 生成 base_rate<yymmdd>.xlsx；
     2. 已配置 SMB 时把当天已抓取的汇率 Excel 上传到
        <SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/，远端已存在同大小同名文件时跳过，
        不重复上传；
@@ -62,7 +69,9 @@ SMB 上传（默认流程，可选）：
          （并发往 SFTP）；已经上传过就不发；
        - FX_RECIEVER：自定义/交易所只要有一个本轮新上传过，就把两个附件
          放一起发一封邮件；无交易所汇率时不发，避免误导；
-    4. 未配置 SMB 时只在本地生成 Excel，不上传，按原行为发邮件。
+    4. 港元最优惠利率表 base_rate<yymmdd>.xlsx 同步到 SFTP 的日期目录
+       （未配置 SFTP 时跳过，此步骤不影响邮件）；
+    5. 未配置 SMB 时只在本地生成 Excel，不上传，按原行为发邮件。
 
 当日复用：
     自定义汇率（含 自定义汇率yymmdd.xlsx 与 BOCHK 页面截图）以日期为维度
@@ -726,16 +735,21 @@ def _print_sftp_tree(remote_dir: str, max_depth: int | None) -> int:
     return 0
 
 
-def _upload_boc_excel_to_sftp(custom_path: Path | None, date_str: str) -> None:
+def _upload_boc_excel_to_sftp(
+    custom_path: Path | None,
+    date_str: str,
+    force: bool = False,
+) -> None:
     """把仅自定义汇率（BOC）的 Excel 上传到 SFTP 的日期目录下。
 
     远端路径为 <SFTP_DIR>/<YYYYMMDD>/<文件名>，目录不存在时自动创建。
-    未配置 SFTP 环境变量时直接跳过；上传失败只记录错误并发企业微信通知，
-    不影响已发出的 BOC 汇率邮件。
+    远端已存在同名文件时跳过（force=True 才覆盖）；未配置 SFTP 时直接
+    跳过；上传失败只记录错误并发企业微信通知，不影响已发出的邮件。
 
     Args:
         custom_path: 自定义汇率 xlsx 本地路径，None 或文件不存在时跳过
         date_str: 目标日期 YYYYMMDD，用作 SFTP 上的子目录名
+        force: True 时覆盖远端同名文件
     """
     if not custom_path or not Path(custom_path).exists():
         logger.warning(
@@ -747,7 +761,7 @@ def _upload_boc_excel_to_sftp(custom_path: Path | None, date_str: str) -> None:
         logger.info("[FX] 未配置 SFTP（SFTP / SFTP_USER），跳过上传")
         return
     try:
-        remote_path = upload_rate_file(Path(custom_path), date_str)
+        remote_path = upload_rate_file(Path(custom_path), date_str, force=force)
     except Exception as exc:
         logger.error("[FX] 上传自定义汇率到 SFTP 失败: %s", exc)
         try:
@@ -755,17 +769,77 @@ def _upload_boc_excel_to_sftp(custom_path: Path | None, date_str: str) -> None:
         except Exception as we:
             logger.error("[FX] 企业微信错误通知发送失败: %s", we)
         return
+    if remote_path is None:
+        logger.info("[FX] 自定义汇率远端已存在，未重复上传 (date=%s)", date_str)
+        return
     logger.info("[FX] 自定义汇率已上传到 SFTP: %s", remote_path)
 
 
-def _upload_custom_to_sftp(date_str: str) -> int:
+def _upload_base_rate_to_sftp(
+    base_rate_path: Path | None,
+    date_str: str,
+    force: bool = False,
+    force_base_rate: bool = False,
+) -> None:
+    """把港元最优惠利率 Excel 上传到 SFTP 的日期目录下。
+
+    远端路径为 <SFTP_DIR>/<YYYYMMDD>/base_rate<yymmdd>.xlsx，
+    与自定义汇率使用同一个日期目录。远端已存在同名文件时跳过，
+    force（全部文件）或 force_base_rate（仅本文件）为 True 时覆盖；
+    未配置 SFTP 时跳过；上传失败只记日志并发企业微信通知，不影响邮件。
+
+    Args:
+        base_rate_path: base_rate xlsx 本地路径，None 或文件不存在时跳过
+        date_str: 目标日期 YYYYMMDD，用作 SFTP 上的子目录名
+        force: True 时覆盖所有 SFTP 同名文件
+        force_base_rate: True 时仅覆盖 base_rate 同名文件
+    """
+    if not base_rate_path or not Path(base_rate_path).exists():
+        logger.warning(
+            "[FX] 港元最优惠利率文件不存在，跳过 SFTP 上传 "
+            "(date=%s, path=%s)",
+            date_str, base_rate_path,
+        )
+        return
+    if not sftp_enabled():
+        logger.info("[FX] 未配置 SFTP（SFTP / SFTP_USER），跳过上传")
+        return
+    try:
+        remote_path = upload_rate_file(
+            Path(base_rate_path), date_str,
+            force=force or force_base_rate,
+        )
+    except Exception as exc:
+        logger.error("[FX] 上传港元最优惠利率到 SFTP 失败: %s", exc)
+        try:
+            send_error(
+                f"【汇率导出异常 {date_str}】SFTP 上传 base_rate 失败: {exc}"
+            )
+        except Exception as we:
+            logger.error("[FX] 企业微信错误通知发送失败: %s", we)
+        return
+    if remote_path is None:
+        logger.info("[FX] 港元最优惠利率远端已存在，未重复上传 (date=%s)", date_str)
+        return
+    logger.info("[FX] 港元最优惠利率已上传到 SFTP: %s", remote_path)
+
+
+def _upload_custom_to_sftp(
+    date_str: str,
+    force: bool = False,
+    force_base_rate: bool = False,
+) -> int:
     """只把 temp 里的自定义汇率 Excel 上传到 SFTP 后退出，不发邮件。
 
     远端路径与 --upload-boc 一致：<SFTP_DIR>/<YYYYMMDD>/<文件名>。
+    远端已存在同名文件时跳过（自定义汇率仅在 force=True 时覆盖，
+    base_rate 在 force 或 force_base_rate 为 True 时覆盖）；
     找不到本地文件或未配置 SFTP 时报错退出（退出码 1）。
 
     Args:
         date_str: 目标日期 YYYYMMDD，用作 SFTP 上的子目录名
+        force: True 时覆盖所有 SFTP 同名文件
+        force_base_rate: True 时仅覆盖 base_rate 同名文件
 
     Returns:
         进程退出码：0 成功，1 失败
@@ -781,13 +855,27 @@ def _upload_custom_to_sftp(date_str: str) -> int:
         print("错误: 未配置 SFTP（缺少 SFTP / SFTP_USER）", file=sys.stderr)
         return 1
     try:
-        remote_path = upload_rate_file(local_path, date_str)
+        remote_path = upload_rate_file(local_path, date_str, force=force)
     except Exception as exc:
         logger.error("[FX] 上传自定义汇率到 SFTP 失败: %s", exc)
         print(f"错误: 上传自定义汇率到 SFTP 失败: {exc}", file=sys.stderr)
         return 1
-    logger.info("[FX] 自定义汇率已上传到 SFTP: %s -> %s", local_path, remote_path)
-    print(f"已上传: {local_path} -> {remote_path}")
+    if remote_path is None:
+        logger.info(
+            "[FX] 自定义汇率远端已存在，未重复上传: %s (date=%s)",
+            local_path, date_str,
+        )
+        print(f"已跳过(远端已存在): {local_path}")
+    else:
+        logger.info(
+            "[FX] 自定义汇率已上传到 SFTP: %s -> %s", local_path, remote_path,
+        )
+        print(f"已上传: {local_path} -> {remote_path}")
+    # 同期的港元最优惠利率表一并同步（文件不存在时只告警）
+    _upload_base_rate_to_sftp(
+        _TEMP_DIR / f"base_rate{yymmdd}.xlsx", date_str,
+        force=force, force_base_rate=force_base_rate,
+    )
     return 0
 
 
@@ -876,6 +964,12 @@ def _run_smb_mode(args: argparse.Namespace, date_str: str) -> int:
                 "[FX] 已上传到 SMB: %s -> %s", local_path, remote_path,
             )
             print(f"已上传: {local_path} -> {remote_path}")
+
+    # 港元最优惠利率表同步到 SFTP（与默认流程一致，不受邮件配置影响）
+    _upload_base_rate_to_sftp(
+        _TEMP_DIR / f"base_rate{yymmdd}.xlsx", date_str,
+        force=args.force, force_base_rate=args.force_base_rate,
+    )
     return 1 if failed else 0
 
 
@@ -921,7 +1015,11 @@ def _capture_rate_files(args: argparse.Namespace, date_str: str) -> int:
         return 1
 
     generated = [
-        str(p) for p in (result.get("custom_path"), result.get("exchange_path"))
+        str(p) for p in (
+            result.get("custom_path"),
+            result.get("exchange_path"),
+            result.get("base_rate_path"),
+        )
         if p
     ]
     logger.info(
@@ -1013,7 +1111,8 @@ def main() -> None:
     parser.add_argument(
         "--upload-sftp",
         metavar="YYYYMMDD",
-        help="只把 temp 里的自定义汇率(自定义汇率{yymmdd}.xlsx)上传到 SFTP 并退出，"
+        help="只把 temp 里的自定义汇率(自定义汇率{yymmdd}.xlsx)与港元最优惠利率"
+             "(base_rate{yymmdd}.xlsx，存在时)上传到 SFTP 并退出，"
              "不抓取、不发邮件、不发企业微信",
     )
     parser.add_argument(
@@ -1031,14 +1130,25 @@ def main() -> None:
         metavar="N",
         help=f"--sftp-tree 的递归层级，默认 {DEFAULT_TREE_DEPTH}",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="SFTP 上传时覆盖所有远端已存在的同名文件（默认已存在则跳过）",
+    )
+    parser.add_argument(
+        "--force-base-rate",
+        action="store_true",
+        help="只覆盖 SFTP 上的 base_rate<yymmdd>.xlsx，不影响其他文件",
+    )
     args = parser.parse_args()
 
     # 按命令行参数重新初始化日志（模块导入时已用默认配置过一次）
     setup_logging(level=args.log_level, log_dir=args.log_dir, force=True)
     logger.info(
-        "[FX] 命令行参数: date=%s, no_wechat=%s, no_reuse=%s, log_level=%s",
-        args.date or "(今天)", args.no_wechat, args.no_reuse,
-        args.log_level or "(默认 INFO)",
+        "[FX] 命令行参数: date=%s, no_wechat=%s, no_reuse=%s, force=%s, "
+        "force_base_rate=%s, log_level=%s",
+        args.date or "(今天)", args.no_wechat, args.no_reuse, args.force,
+        args.force_base_rate, args.log_level or "(默认 INFO)",
     )
     logger.info("[FX] 日志文件: %s", log_file_path() or "(仅控制台)")
 
@@ -1055,7 +1165,9 @@ def main() -> None:
             logger.error("日期格式不正确 %s (应为 YYYYMMDD)", date_str)
             print(f"错误: 日期格式不正确 {date_str} (应为 YYYYMMDD)", file=sys.stderr)
             sys.exit(1)
-        sys.exit(_upload_custom_to_sftp(date_str))
+        sys.exit(_upload_custom_to_sftp(
+            date_str, force=args.force, force_base_rate=args.force_base_rate,
+        ))
 
     # SMB 模式：已配置 SMB 则上传当日已抓取的汇率 Excel；未配置则改为抓取
     if args.upload_smb:
@@ -1224,6 +1336,12 @@ def _run_default_flow(args: argparse.Namespace, date_str: str) -> int:
                 )
                 print(f"已上传: {local_path} -> {remote_path}")
 
+    # 2.5 港元最优惠利率表同步到 SFTP（不受邮件收件人配置影响）
+    _upload_base_rate_to_sftp(
+        result.get("base_rate_path"), date_str,
+        force=args.force, force_base_rate=args.force_base_rate,
+    )
+
     # 3. 发邮件：只有本轮新上传过对应文件才发
     failed = bool(hkex_errors)
 
@@ -1283,7 +1401,9 @@ def _run_default_flow(args: argparse.Namespace, date_str: str) -> int:
                 boc_recipients, subject, html_body, boc_attachments, cc=boc_cc,
             )
             # BOC（仅自定义汇率）的 Excel 同步放到 SFTP 的 YYYYMMDD 目录下
-            _upload_boc_excel_to_sftp(custom_path, date_str)
+            _upload_boc_excel_to_sftp(
+                custom_path, date_str, force=args.force,
+            )
 
     if not fx_recipients and not boc_recipients:
         logger.info("[FX] 未配置收件人（FX/BOC_RECIEVER），本次仅上传不发邮件")

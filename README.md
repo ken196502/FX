@@ -17,13 +17,31 @@ uv run fxmail --sftp-tree 20261009 --sftp-depth 2
 
 ## SFTP 上传
 
-给 BOC_RECIEVER 发「仅自定义汇率」邮件时，同时把该 Excel 上传到 SFTP：
+给 BOC_RECIEVER 发「仅自定义汇率」邮件时，同时把该 Excel 上传到 SFTP；
+港元最优惠利率表 `base_rate<yymmdd>.xlsx` 每次默认流程都会同步到同一日期目录
+（不受邮件收件人配置影响）：
 
 ```
 <SFTP_DIR>/<YYYYMMDD>/自定义汇率<yymmdd>.xlsx
+<SFTP_DIR>/<YYYYMMDD>/base_rate<yymmdd>.xlsx
 ```
 
-例如 `FX_Rates/20261009/自定义汇率261009.xlsx`（目录不存在会自动创建）。
+例如 `FX_Rates/20261009/自定义汇率261009.xlsx`、`FX_Rates/20261009/base_rate261009.xlsx`
+（目录不存在会自动创建）。`base_rate` 表字段为
+`base_rate_code / base_rate_name / money_type / saving_rate / prime_rate /
+day_year / vaild_date / remark`，其中 `saving_rate` 固定为 0，`prime_rate` 取
+BOCHK 港元最优惠利率的小数值（5.00000% → 0.05），`vaild_date` 为抓取当日
+（YYYYMMDD）。
+
+**远端已存在同名文件时默认跳过，不覆盖**。两个覆盖开关：
+
+```bash
+uv run fxmail --upload-sftp 20261009                    # 已存在则跳过
+uv run fxmail --upload-sftp 20261009 --force            # 覆盖所有 SFTP 同名文件（含自定义汇率）
+uv run fxmail --date 20261009 --force-base-rate         # 只覆盖 SFTP 上的 base_rate
+```
+
+`--force` / `--force-base-rate` 对默认流程、`--upload-smb`、`--upload-sftp` 中的 SFTP 上传都生效；SMB 上传仍按同大小跳过，不受这两个开关影响。
 
 | 环境变量 | 说明 |
 | --- | --- |
@@ -50,12 +68,13 @@ uv run fxmail --sftp-tree /FX_Rates --sftp-depth 2   # 需要更深层时显式�
 
 `uv run fxmail` 不带参数时执行（`--upload-smb YYYYMMDD` 是它的「只上传、不发邮件」版本）：
 
-1. **当天还没抓取过**（`temp/` 里没有当天 Excel）：先尝试抓取——检测到 `FX_RECIEVER`（或未配置任何收件人）时**银行（BOCHK）和交易所（HKEx）都抓**；只有 `BOC_RECIEVER` 时只抓银行，在 `temp/` 生成对应 xlsx；
+1. **当天还没抓取过**（`temp/` 里没有当天 Excel）：先尝试抓取——检测到 `FX_RECIEVER`（或未配置任何收件人）时**银行（BOCHK）和交易所（HKEx）都抓**；只有 `BOC_RECIEVER` 时只抓银行；两种模式都同时抓 [BOCHK 港元最优惠利率](https://www.bochk.com/en/investment/rates/hkprime.html)，在 `temp/` 生成 `base_rate<yymmdd>.xlsx`；
 2. **已配置 SMB**：把当天已抓取的汇率 Excel 上传到 `<SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/`，**远端已存在同大小同名文件时跳过，不重复上传**；大小不一致才重新上传；
 3. **按「没有上传过的才发邮件」发邮件**：
    - 检测到 `BOC_RECIEVER`：自定义汇率**上传后就发**「仅自定义汇率」邮件（并发往 SFTP）；**已经上传过（本轮跳过）就不发**；
    - 检测到 `FX_RECIEVER`：两个文件都上传（跳过已上传）后，**两个附件放一起发一封邮件**；无交易所汇率时不发，避免误导；
-4. **未配置 SMB**：只在本地生成 Excel，不上传；此时所有本地文件按「未上传过」处理，照常发邮件。
+4. 将 `base_rate<yymmdd>.xlsx` 同步到 SFTP 的同日期目录（未配置 SFTP 时跳过，不影响邮件）；
+5. **未配置 SMB**：只在本地生成 Excel，不上传；此时所有本地文件按「未上传过」处理，照常发邮件。
 
 任一文件上传失败都会记日志、发企业微信通知并以退出码 1 结束，不做静默兜底；BOCHK 等关键数据异常时不上传、不发汇率邮件（给 `BOC_RECIEVER` 发错误报告），退出码 1。
 
@@ -69,7 +88,7 @@ uv run fxmail --sftp-tree /FX_Rates --sftp-depth 2   # 需要更深层时显式�
 
 远端布局为 `<SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/<文件名>`，例如 `FX_Rates/2026/20261009/自定义汇率261009.xlsx`（目录不存在会自动创建）。
 
-同日复用：自定义汇率、交易所汇率与截图都进当日快照（`temp/custom_snapshot_yyyymmdd.json`），同日第二次及以后的运行不重复抓取、不重复改写 Excel（文件字节稳定，「已上传」判断才可靠）。
+同日复用：自定义汇率、交易所汇率、港元最优惠利率与截图都进当日快照（`temp/custom_snapshot_yyyymmdd.json`），同日第二次及以后的运行不重复抓取、不重复改写 Excel（文件字节稳定，「已上传」判断才可靠）。
 
 ## 日志
 
