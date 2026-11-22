@@ -30,8 +30,8 @@ uv run fxmail --sftp-tree 20261009 --sftp-depth 2
 （目录不存在会自动创建）。`base_rate` 表字段为
 `base_rate_code / base_rate_name / money_type / saving_rate / prime_rate /
 day_year / vaild_date / remark`，其中 `saving_rate` 固定为 0，`prime_rate` 取
-BOCHK 港元最优惠利率的小数值（5.00000% → 0.05），`vaild_date` 为抓取当日
-（YYYYMMDD）。
+BOCHK 港元最优惠利率的小数值（5.00000% → 0.05），`vaild_date` 是有效期限，
+固定写死为 `20991231`（与抓取日期无关）。
 
 **远端已存在同名文件时默认跳过，不覆盖**。两个覆盖开关：
 

@@ -9,7 +9,8 @@ rate_export.py - 汇率整合导出
   1. 自定义汇率yymmdd.xlsx — 来源: BOCHK 港币电汇牌价（按公式计算）
   2. 交易所汇率yymmdd.xlsx — 来源: 仅 HKEx 印花税率
   3. base_rateyymmdd.xlsx — 来源: BOCHK 港元最优惠利率页面
-     （saving_rate 固定 0，prime_rate 为页面利率的小数值，vaild_date 为当日）
+     （saving_rate 固定 0，prime_rate 为页面利率的小数值，
+     vaild_date 是有效期限，固定 20991231）
 
 自定义汇率计算公式（参照 TFISF Excel）：
   F = Bid  = BOCHK 客户卖出价 (银行买入价)
@@ -214,6 +215,8 @@ BASE_RATE_NAME = "HKD 5"
 BASE_RATE_MONEY_TYPE = "HKD"
 BASE_RATE_SAVING_RATE = 0
 BASE_RATE_DAY_YEAR = 365
+# vaild_date 是有效期限，不是抓取日期，按业务默认值写死
+BASE_RATE_VALID_DATE = 20991231
 
 
 # ---------------------------------------------------------------------------
@@ -799,31 +802,26 @@ def _write_xlsx(
 
 def _write_base_rate_xlsx(
     prime_data: dict,
-    date_str: str,
     output_path: Path,
 ) -> None:
     """生成港元最优惠利率导入表 base_rate<yymmdd>.xlsx。
 
     saving_rate 固定为 0（不取抓取值）；prime_rate 取页面利率的百分数，
-    除以 100 换成小数（5.00000% -> 0.05）；vaild_date 用目标日期。
+    除以 100 换成小数（5.00000% -> 0.05）；vaild_date 是有效期限，
+    固定 20991231，与抓取日期无关。
 
     Args:
         prime_data: fetch_bochk_prime_rate 的返回字典
-        date_str: 目标日期 YYYYMMDD
         output_path: 输出文件路径
 
     Raises:
-        RuntimeError: 未取到有效利率或日期格式不对
+        RuntimeError: 未取到有效利率
     """
     rate_percent = _to_float(prime_data.get("rate_percent"))
     if rate_percent <= 0:
         raise RuntimeError(
             f"港元最优惠利率数据无效 (rate_percent={prime_data.get('rate_percent')!r})"
         )
-    try:
-        valid_date = int(date_str)
-    except (TypeError, ValueError) as exc:
-        raise RuntimeError(f"日期格式不正确 (应为 YYYYMMDD): {date_str}") from exc
     rate_decimal = round(rate_percent / 100.0, 8)
 
     row = [
@@ -833,7 +831,7 @@ def _write_base_rate_xlsx(
         BASE_RATE_SAVING_RATE,
         rate_decimal,
         BASE_RATE_DAY_YEAR,
-        valid_date,
+        BASE_RATE_VALID_DATE,
         "",
     ]
 
@@ -1158,7 +1156,7 @@ def process_rate_export(
     base_rate_path: Path | None = None
     if prime_rate_data:
         base_rate_path = out_dir / f"base_rate{yymmdd}.xlsx"
-        _write_base_rate_xlsx(prime_rate_data, date_str, base_rate_path)
+        _write_base_rate_xlsx(prime_rate_data, base_rate_path)
         logger.info(
             "[RE] 生成港元最优惠利率: %s (%.5f%%)",
             base_rate_path, prime_rate_data["rate_percent"],
