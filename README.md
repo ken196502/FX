@@ -18,8 +18,8 @@ uv run fxmail --sftp-tree 20261009 --sftp-depth 2
 ## SFTP 上传
 
 给 BOC_RECIEVER 发「仅自定义汇率」邮件时，同时把该 Excel 上传到 SFTP；
-港元最优惠利率表 `base_rate<yymmdd>.xlsx` 每次默认流程都会同步到同一日期目录
-（不受邮件收件人配置影响）：
+港元最优惠利率表 `base_rate<yymmdd>.xlsx` 只在利率与历史记录相比有变化时
+才生成并同步到同一日期目录（不受邮件收件人配置影响）：
 
 ```
 <SFTP_DIR>/<YYYYMMDD>/自定义汇率<yymmdd>.xlsx
@@ -32,6 +32,11 @@ uv run fxmail --sftp-tree 20261009 --sftp-depth 2
 day_year / vaild_date / remark`，其中 `saving_rate` 固定为 0，`prime_rate` 取
 BOCHK 港元最优惠利率的小数值（5.00000% → 0.05），`vaild_date` 是有效期限，
 固定写死为 `20991231`（与抓取日期无关）。
+
+**历史利率来源**：`temp/custom_snapshot_YYYYMMDD.json` 中的 `prime_rate_data`，
+取日期早于本次、最近一次有利率的记录。没有历史记录时视为首次，照常生成；
+利率无变化时既不生成本地文件，也不上传 SFTP。`--force` / `--force-base-rate`
+可强制生成并上传，即使利率没变。
 
 **远端已存在同名文件时默认跳过，不覆盖**。两个覆盖开关：
 
@@ -68,12 +73,12 @@ uv run fxmail --sftp-tree /FX_Rates --sftp-depth 2   # 需要更深层时显式�
 
 `uv run fxmail` 不带参数时执行（`--upload-smb YYYYMMDD` 是它的「只上传、不发邮件」版本）：
 
-1. **当天还没抓取过**（`temp/` 里没有当天 Excel）：先尝试抓取——检测到 `FX_RECIEVER`（或未配置任何收件人）时**银行（BOCHK）和交易所（HKEx）都抓**；只有 `BOC_RECIEVER` 时只抓银行；两种模式都同时抓 [BOCHK 港元最优惠利率](https://www.bochk.com/en/investment/rates/hkprime.html)，在 `temp/` 生成 `base_rate<yymmdd>.xlsx`；
+1. **当天还没抓取过**（`temp/` 里没有当天 Excel）：先尝试抓取——检测到 `FX_RECIEVER`（或未配置任何收件人）时**银行（BOCHK）和交易所（HKEx）都抓**；只有 `BOC_RECIEVER` 时只抓银行；两种模式都同时抓 [BOCHK 港元最优惠利率](https://www.bochk.com/en/investment/rates/hkprime.html)，与历史利率相比有变化时才在 `temp/` 生成 `base_rate<yymmdd>.xlsx`；
 2. **已配置 SMB**：把当天已抓取的汇率 Excel 上传到 `<SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/`，**远端已存在同大小同名文件时跳过，不重复上传**；大小不一致才重新上传；
 3. **按「没有上传过的才发邮件」发邮件**：
    - 检测到 `BOC_RECIEVER`：自定义汇率**上传后就发**「仅自定义汇率」邮件（并发往 SFTP）；**已经上传过（本轮跳过）就不发**；
    - 检测到 `FX_RECIEVER`：两个文件都上传（跳过已上传）后，**两个附件放一起发一封邮件**；无交易所汇率时不发，避免误导；
-4. 将 `base_rate<yymmdd>.xlsx` 同步到 SFTP 的同日期目录（未配置 SFTP 时跳过，不影响邮件）；
+4. 若利率有变化，将 `base_rate<yymmdd>.xlsx` 同步到 SFTP 的同日期目录（未配置 SFTP 时跳过，不影响邮件）；
 5. **未配置 SMB**：只在本地生成 Excel，不上传；此时所有本地文件按「未上传过」处理，照常发邮件。
 
 任一文件上传失败都会记日志、发企业微信通知并以退出码 1 结束，不做静默兜底；BOCHK 等关键数据异常时不上传、不发汇率邮件（给 `BOC_RECIEVER` 发错误报告），退出码 1。

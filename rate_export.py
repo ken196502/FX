@@ -917,6 +917,47 @@ def _load_snapshot(snapshot_path: Path, date_str: str) -> dict | None:
     return data
 
 
+def _last_recorded_prime_rate(out_dir: Path, date_str: str) -> float | None:
+    """从历史快照中读取最近一次记录的港元最优惠利率。
+
+    历史数据复用已有的 custom_snapshot_YYYYMMDD.json，不额外维护状态文件。
+    只看日期早于 date_str 的快照，按日期倒序取第一个有利率的记录；
+    快照损坏或没有 prime_rate_data 时跳过继续往前找。
+
+    Args:
+        out_dir: 快照所在目录
+        date_str: 目标日期 YYYYMMDD（不包含在历史里）
+
+    Returns:
+        最近一次记录的利率百分数，没有任何历史记录时返回 None
+    """
+    prefix = "custom_snapshot_"
+    candidates = [
+        p for p in out_dir.glob(f"{prefix}*.json")
+        if (p.stem[len(prefix):].isdigit()
+            and len(p.stem[len(prefix):]) == 8
+            and p.stem[len(prefix):] < date_str)
+    ]
+    for path in sorted(candidates, reverse=True):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.debug("[RE] 历史快照读取失败，跳过: %s", path.name)
+            continue
+        if not isinstance(data, dict):
+            continue
+        prime = data.get("prime_rate_data") or {}
+        rate = _to_float(prime.get("rate_percent"))
+        if rate > 0:
+            logger.info(
+                "[RE] 上次记录的港元最优惠利率: %.5f%% (快照 %s)",
+                rate, path.name,
+            )
+            return rate
+    logger.info("[RE] 未找到历史港元最优惠利率记录，视为首次")
+    return None
+
+
 def _save_snapshot(
     snapshot_path: Path,
     date_str: str,
@@ -985,6 +1026,7 @@ def process_rate_export(
     include_hkex: bool = True,
     capture_screenshots: bool = True,
     reuse_daily: bool = True,
+    force_base_rate: bool = False,
 ) -> dict:
     """从 BOCHK 获取汇率并按 TFISF Excel 公式计算自定义汇率，生成 xlsx 文件。
 
@@ -993,6 +1035,9 @@ def process_rate_export(
     时也不再抓取 HKEx、不重复改写 Excel 文件（文件字节保持稳定，
     SMB「不重复上传」的大小判断才可靠）；只有当日快照不存在（或快照里
     没有对应数据）时才真正抓取对应页面。
+
+    港元最优惠利率表只在该利率与历史快照中最近一次记录不同时才生成；
+    force_base_rate=True 时无论是否变化都生成。
 
     Args:
         date_str: YYYYMMDD 格式日期，None 表示今天
@@ -1007,6 +1052,7 @@ def process_rate_export(
         reuse_daily: 是否复用当日快照（自定义汇率、交易所汇率、
             港元最优惠利率与截图），默认 True；False 则强制重新抓取
             BOCHK / HKEx / 港元最优惠利率并重新生成文件
+        force_base_rate: True 时即使利率无变化也生成 base_rate 文件
 
     Returns:
         包含以下键的字典：
@@ -1014,7 +1060,8 @@ def process_rate_export(
           - date_val: dt.date 日期对象
           - custom_path: 自定义汇率 xlsx 文件路径
           - exchange_path: 交易所汇率 xlsx 文件路径
-          - base_rate_path: 港元最优惠利率 xlsx 文件路径
+          - base_rate_path: 港元最优惠利率 xlsx 文件路径；利率无变化时 None
+          - base_rate_changed: 利率是否与历史记录不同（或强制生成）
           - custom_rows: 自定义汇率行列表
           - exchange_rows: 交易所汇率行列表
           - bochk_hkd_raw: BOCHK 港币原始汇率字典
@@ -1150,17 +1197,34 @@ def process_rate_export(
         _write_xlsx(custom_rows, custom_path, date_val)
         logger.info("[RE] 生成自定义汇率: %s (%d 行)", custom_path, len(custom_rows))
 
-    # 港元最优惠利率导入表：利率值可来自当日快照，但文件每次重写，
-    # 这样改了固定字段（如 saving_rate）后同日补跑也能立刻生效。
-    # 该文件不走 SMB「同大小跳过」逻辑，无需保持字节稳定。
+    # 港元最优惠利率导入表：与历史快照中最近一次利率比较，
+    # 有变化（或 force_base_rate）才生成，避免利率没变时天天上传。
     base_rate_path: Path | None = None
+    base_rate_changed = False
     if prime_rate_data:
-        base_rate_path = out_dir / f"base_rate{yymmdd}.xlsx"
-        _write_base_rate_xlsx(prime_rate_data, base_rate_path)
-        logger.info(
-            "[RE] 生成港元最优惠利率: %s (%.5f%%)",
-            base_rate_path, prime_rate_data["rate_percent"],
+        current_rate = _to_float(prime_rate_data.get("rate_percent"))
+        previous_rate = _last_recorded_prime_rate(out_dir, date_str)
+        actual_change = (
+            previous_rate is None
+            or round(current_rate, 6) != round(previous_rate, 6)
         )
+        base_rate_changed = force_base_rate or actual_change
+        if base_rate_changed:
+            base_rate_path = out_dir / f"base_rate{yymmdd}.xlsx"
+            _write_base_rate_xlsx(prime_rate_data, base_rate_path)
+            prev_text = (
+                f"{previous_rate:.5f}%" if previous_rate is not None else "无记录"
+            )
+            if actual_change:
+                reason = f"上次 {prev_text} -> 本次 {current_rate:.5f}%"
+            else:
+                reason = f"强制生成，利率未变化 ({current_rate:.5f}%)"
+            logger.info("[RE] 港元最优惠利率%s，生成: %s", reason, base_rate_path)
+        else:
+            logger.info(
+                "[RE] 港元最优惠利率与上次一致 (%.5f%%)，不生成 base_rate 文件",
+                current_rate,
+            )
     else:
         logger.warning("[RE] 未获取到港元最优惠利率，不生成 base_rate 文件")
 
@@ -1255,6 +1319,7 @@ def process_rate_export(
         "custom_path": custom_path,
         "exchange_path": exchange_path,
         "base_rate_path": base_rate_path,
+        "base_rate_changed": base_rate_changed,
         "custom_rows": custom_rows,
         "exchange_rows": exchange_rows,
         "bochk_hkd_raw": bochk_hkd_raw,

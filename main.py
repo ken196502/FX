@@ -30,8 +30,8 @@ SFTP 上传（环境变量，可选）：
     SFTP=host[:port] / SFTP_DIR / SFTP_USER / SFTP_PWD
     给 BOC_RECIEVER 发出「仅自定义汇率」邮件后，会把该 Excel 同步上传到
     <SFTP_DIR>/<YYYYMMDD>/ 下（目录不存在自动创建）。
-    港元最优惠利率表 base_rate<yymmdd>.xlsx 每次默认流程都会同步到同一
-    日期目录，不受邮件收件人配置影响。
+    港元最优惠利率表 base_rate<yymmdd>.xlsx 只在利率与历史记录（当日快照）
+    相比有变化时才生成并同步到同一日期目录，不受邮件收件人配置影响。
     远端已存在同名文件时默认跳过；--force 覆盖所有 SFTP 同名文件，
     --force-base-rate 只覆盖 base_rate（不影响自定义汇率）。
     未配置 SFTP / SFTP_USER 时跳过；上传失败只记日志并发企业微信通知，
@@ -60,7 +60,7 @@ SMB 上传（默认流程，可选）：
     1. 当天还没有生成过汇率 Excel 时，先尝试抓取——检测到 FX_RECIEVER
        （或未配置任何收件人）时银行（BOCHK）和交易所（HKEx）都抓；只有
        BOC_RECIEVER 时只抓银行；无论哪种模式都同时抓港元最优惠利率页面，
-       在 temp/ 生成 base_rate<yymmdd>.xlsx；
+       与历史利率相比有变化时才在 temp/ 生成 base_rate<yymmdd>.xlsx；
     2. 已配置 SMB 时把当天已抓取的汇率 Excel 上传到
        <SMB_REMOTE_DIR>/<YYYY>/<YYYYMMDD>/，远端已存在同大小同名文件时跳过，
        不重复上传；
@@ -69,7 +69,7 @@ SMB 上传（默认流程，可选）：
          （并发往 SFTP）；已经上传过就不发；
        - FX_RECIEVER：自定义/交易所只要有一个本轮新上传过，就把两个附件
          放一起发一封邮件；无交易所汇率时不发，避免误导；
-    4. 港元最优惠利率表 base_rate<yymmdd>.xlsx 同步到 SFTP 的日期目录
+    4. 港元最优惠利率表（有变化才生成）同步到 SFTP 的日期目录
        （未配置 SFTP 时跳过，此步骤不影响邮件）；
     5. 未配置 SMB 时只在本地生成 Excel，不上传，按原行为发邮件。
 
@@ -871,11 +871,15 @@ def _upload_custom_to_sftp(
             "[FX] 自定义汇率已上传到 SFTP: %s -> %s", local_path, remote_path,
         )
         print(f"已上传: {local_path} -> {remote_path}")
-    # 同期的港元最优惠利率表一并同步（文件不存在时只告警）
-    _upload_base_rate_to_sftp(
-        _TEMP_DIR / f"base_rate{yymmdd}.xlsx", date_str,
-        force=force, force_base_rate=force_base_rate,
-    )
+    # 同期的港元最优惠利率表：利率无变化时不生成文件，也就没有上传
+    base_rate_path = _TEMP_DIR / f"base_rate{yymmdd}.xlsx"
+    if base_rate_path.exists():
+        _upload_base_rate_to_sftp(
+            base_rate_path, date_str,
+            force=force, force_base_rate=force_base_rate,
+        )
+    else:
+        logger.info("[FX] 无 base_rate 文件（利率未变化），跳过 SFTP 上传")
     return 0
 
 
@@ -965,11 +969,15 @@ def _run_smb_mode(args: argparse.Namespace, date_str: str) -> int:
             )
             print(f"已上传: {local_path} -> {remote_path}")
 
-    # 港元最优惠利率表同步到 SFTP（与默认流程一致，不受邮件配置影响）
-    _upload_base_rate_to_sftp(
-        _TEMP_DIR / f"base_rate{yymmdd}.xlsx", date_str,
-        force=args.force, force_base_rate=args.force_base_rate,
-    )
+    # 港元最优惠利率表同步到 SFTP（利率有变化才生成文件）
+    base_rate_path = _TEMP_DIR / f"base_rate{yymmdd}.xlsx"
+    if base_rate_path.exists():
+        _upload_base_rate_to_sftp(
+            base_rate_path, date_str,
+            force=args.force, force_base_rate=args.force_base_rate,
+        )
+    else:
+        logger.info("[FX] 无 base_rate 文件（利率未变化），跳过 SFTP 上传")
     return 1 if failed else 0
 
 
@@ -994,6 +1002,7 @@ def _capture_rate_files(args: argparse.Namespace, date_str: str) -> int:
             send_error_notify=not args.no_wechat,
             include_hkex=True,
             reuse_daily=not args.no_reuse,
+            force_base_rate=args.force or args.force_base_rate,
         )
     except Exception as exc:
         logger.error("[FX] 汇率抓取失败: %s\n%s", exc, traceback.format_exc())
@@ -1258,6 +1267,7 @@ def _run_default_flow(args: argparse.Namespace, date_str: str) -> int:
             send_error_notify=not args.no_wechat,
             include_hkex=include_hkex,
             reuse_daily=not args.no_reuse,
+            force_base_rate=args.force or args.force_base_rate,
         )
     except Exception as exc:
         tb_text = traceback.format_exc()
@@ -1337,10 +1347,13 @@ def _run_default_flow(args: argparse.Namespace, date_str: str) -> int:
                 print(f"已上传: {local_path} -> {remote_path}")
 
     # 2.5 港元最优惠利率表同步到 SFTP（不受邮件收件人配置影响）
-    _upload_base_rate_to_sftp(
-        result.get("base_rate_path"), date_str,
-        force=args.force, force_base_rate=args.force_base_rate,
-    )
+    if result.get("base_rate_path"):
+        _upload_base_rate_to_sftp(
+            result["base_rate_path"], date_str,
+            force=args.force, force_base_rate=args.force_base_rate,
+        )
+    else:
+        logger.info("[FX] 港元最优惠利率未变化，未生成文件，跳过 SFTP 上传")
 
     # 3. 发邮件：只有本轮新上传过对应文件才发
     failed = bool(hkex_errors)
